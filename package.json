@@ -1,0 +1,35 @@
+{
+  "name": "00_valkey-cache",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc --noEmit",
+    "benchmark": "tsx benchmarks/bench.ts",
+    "bench:small": "docker compose --profile small up --build --abort-on-container-exit",
+    "bench:standard": "docker compose --profile standard up --build --abort-on-container-exit"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@valkey/valkey-glide": "^2.3.1",
+    "config": "^4.4.1",
+    "msgpackr": "^1.11.9",
+    "opossum": "^9.0.0",
+    "p-limit": "^7.3.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/config": "^3.3.5",
+    "@types/opossum": "^8.1.9",
+    "@vitest/coverage-v8": "^4.1.4",
+    "tsdown": "^0.21.7",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.4"
+  }
+}
