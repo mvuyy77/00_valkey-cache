@@ -32,33 +32,40 @@ export class ValkeyService {
 	) {}
 
 	private getBreakerFor(prefix: string): CircuitBreaker {
-		let breaker = this.breakers.get(prefix);
+		const serviceName = this.manifest[prefix].serviceName;
+		let breaker = this.breakers.get(serviceName);
 		if (!breaker) {
 			breaker = new CircuitBreaker(this.performFetch, {
 				allowWarmUp: true,
-				volumeThreshold: 100,
-				timeout: 10000,
-				errorThresholdPercentage: 50,
-				resetTimeout: 30000,
+				volumeThreshold: 100, // Don’t even consider tripping the breaker until at least 100 requests have passed through
+				timeout: 10000, // If a request takes longer than 10 seconds, it’s treated as a failure.
+				errorThresholdPercentage: 50, // If half of the requests fail, the breaker "trips" (opens), and further calls are blocked immediately to give the service a break.
+				resetTimeout: 30000, // Once tripped, the breaker stays open for 30 seconds before trying again.
 				// Only 429 and 5xx count as breaker failures.
-				// 401, 403, 499 are thrown but filtered — not the upstream's fault.
+				// 401, 403, 499 are thrown but filtered — not the upstream’s fault.
 				errorFilter: (err: any) => err.status && err.status !== 429 && err.status < 500,
 			});
-			this.registerBreakerEvents(prefix, breaker);
-			this.breakers.set(prefix, breaker);
+			this.registerBreakerEvents(serviceName, breaker);
+			this.breakers.set(serviceName, breaker);
 		}
 		return breaker;
 	}
 
 	private registerBreakerEvents(prefix: string, breaker: CircuitBreaker): void {
+		//Most critical state; it means the failure rate hit 50% and we've stopped trying to make external api calls
 		breaker.on("open", () =>
 			this.logger.error(`CIRCUIT_OPEN: ${prefix} — error threshold exceeded, requests suspended`));
+		// After the resetTimeout (30s), the breaker allows one request through to see if the service is back up
 		breaker.on("halfOpen", () =>
 			this.logger.warn(`CIRCUIT_HALF_OPEN: ${prefix} — probing upstream`));
+		// Eecovery state, and the external api call is healthy.
 		breaker.on("close", () =>
 			this.logger.info(`CIRCUIT_CLOSED: ${prefix} — upstream recovered`));
+		// This triggers when a single request crosses default 10s limit. It doesn't trip the breaker immediately, but it contributes to the 50% failure threshold.
 		breaker.on("timeout", () =>
 			this.logger.warn(`CIRCUIT_TIMEOUT: ${prefix} — request timed out`));
+		// This logs every time a user tries to make a request while the circuit is already open.
+		// protection from wastage of resources on a known dead or struggling service
 		breaker.on("reject", () =>
 			this.logger.warn(`CIRCUIT_REJECT: ${prefix} — request rejected, circuit is open`));
 	}
@@ -320,8 +327,12 @@ export class ValkeyService {
 		}
 
 		if (this.hasRequestBody(ctx)) {
-			const hashedRequestBody = this.hashRequestBody(ctx.body, hashAlgorithm);
-			if (hashedRequestBody) rawKey += `|requestBody:${hashedRequestBody}`;
+			const canonical = JSON.stringify(ctx.body, (_, v) =>
+				v !== null && typeof v === "object" && !Array.isArray(v)
+					? Object.fromEntries(Object.keys(v).sort().map((k) => [k, v[k]]))
+					: v
+			);
+			if (canonical) rawKey += `|requestBody:${canonical}`;
 		}
 
 		return `${prefix}:${createHash(hashAlgorithm).update(rawKey).digest("hex")}`;
@@ -422,7 +433,6 @@ export class ValkeyService {
 		const response = await fetch(fetchUrl, {
 			method: options.method,
 			headers: {
-				...this.manifest[prefix].staticHeaders,
 				...options.headers,
 			},
 			body: options.body ? JSON.stringify(options.body) : undefined,
@@ -477,16 +487,4 @@ export class ValkeyService {
 		throw error;
 	};
 
-	private hashRequestBody(body: any, hashAlgorithm: string): string | null {
-		if (body == null) return null;
-		// Produce a canonical JSON string with sorted keys at every level so that
-		// { a:1, b:2 } and { b:2, a:1 } hash identically. The string is hashed directly —
-		// no JSON.parse or pack round-trip needed.
-		const canonical = JSON.stringify(body, (_, v) =>
-			v !== null && typeof v === "object" && !Array.isArray(v)
-				? Object.fromEntries(Object.keys(v).sort().map((k) => [k, v[k]]))
-				: v
-		);
-		return createHash(hashAlgorithm).update(canonical).digest("hex");
-	}
 }

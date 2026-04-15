@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 
 // Mock ValkeyClient before any import of index.ts so the module-level
 // code never attempts a real Valkey connection.
-vi.mock("./core/client", () => {
+vi.mock("../src/core/client", () => {
     const MockValkeyClient = vi.fn(function (this: any) {
         this.connect = vi.fn().mockResolvedValue(null); // simulates Valkey DOWN
         this.disconnect = vi.fn().mockResolvedValue(undefined);
@@ -10,8 +10,8 @@ vi.mock("./core/client", () => {
     return { ValkeyClient: MockValkeyClient };
 });
 
-import { ValkeyCacheWrapper } from "./index";
-import { Logger } from "./types/types";
+import { ValkeyCacheWrapper } from "../src/index";
+import { Logger } from "../src/types/types";
 
 // ---------------------------------------------------------------------------
 // Helpers

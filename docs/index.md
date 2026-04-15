@@ -47,7 +47,6 @@ import → module loads, no side effects
 export const ValkeyCacheWrapper;
 
 // Re-exports for consumer convenience
-export { SERVICES_MANIFEST } from "./config/manifest";
 export * from "./types/types";
 ```
 
@@ -77,7 +76,7 @@ const profile = await ValkeyCacheWrapper.getWithFetch<UserProfile>(
     {
         baseUrl: process.env.GATEWAY_URL,
         uri: `/12345`,
-        headers: { "x-request-id": reqId },
+        headers: { apikey: process.env.MS_API_KEY, "x-request-id": reqId },
     },
 );
 ```
@@ -129,7 +128,7 @@ app.get("/profile/:id", async (req, res) => {
         {
             baseUrl: process.env.GATEWAY_URL,
             uri: `/${req.params.id}`,
-            headers: { "x-request-id": req.id },
+            headers: { apikey: process.env.MS_API_KEY, "x-request-id": req.id },
         },
     );
     res.json(data);

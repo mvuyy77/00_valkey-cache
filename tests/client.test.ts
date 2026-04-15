@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { GlideClusterClient } from "@valkey/valkey-glide";
-import { ValkeyClient } from "./client";
-import { Logger } from "../types/types";
+import { ValkeyClient } from "../src/core/client";
+import { Logger } from "../src/types/types";
 
 // ---------------------------------------------------------------------------
 // Mock @valkey/valkey-glide — replace GlideClusterClient.createClient with
@@ -244,6 +244,22 @@ describe("ValkeyClient — connect()", () => {
         expect(mockCreateClient).toHaveBeenCalledTimes(1);
     });
 
+    it("logs VALKEY_CONFIG_ERROR and returns null when initializeValkeyConnection is called with null config", async () => {
+        setValidEnv();
+        const logger = spyLogger();
+        const client = new ValkeyClient(logger);
+
+        // Forcibly null out the config to exercise the early-return guard inside
+        // initializeValkeyConnection (lines 53-54 in client.ts).
+        priv(client).config = null;
+
+        const result = await (client as any).initializeValkeyConnection();
+
+        expect(result).toBeNull();
+        expect(logger.calls.error.some((m) => m.includes("VALKEY_CONFIG_ERROR"))).toBe(true);
+        expect(mockCreateClient).not.toHaveBeenCalled();
+    });
+
     it("deduplicates concurrent connect calls", async () => {
         setValidEnv();
         const fakeGlide = createFakeGlideClient();
@@ -259,6 +275,25 @@ describe("ValkeyClient — connect()", () => {
         expect(a).toBe(b);
         expect(b).toBe(c);
         expect(mockCreateClient).toHaveBeenCalledTimes(1);
+    });
+
+    it("clears clientPromise and returns null when the in-flight promise rejects", async () => {
+        setValidEnv();
+        const logger = spyLogger();
+        const client = new ValkeyClient(logger);
+
+        // Inject a rejecting promise directly to hit the catch block in getClient()
+        // (lines 122-125). initializeValkeyConnection normally swallows errors and
+        // returns null, so the only way to reach this branch is via direct injection.
+        const injected = Promise.reject(new Error("injected rejection"));
+        // Prevent unhandled-rejection noise — getClient() will await and handle it.
+        injected.catch(() => {});
+        priv(client).clientPromise = injected;
+
+        const result = await client.connect();
+
+        expect(result).toBeNull();
+        expect(priv(client).clientPromise).toBeNull(); // cleared so next connect() retries
     });
 
     it("passes credentials when username and password are set", async () => {

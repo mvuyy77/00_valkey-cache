@@ -56,9 +56,9 @@ export interface CacheKeyOptions {
 }
 
 export interface ServiceManifestConfig {
+    serviceName: string,
     method: HttpMethod;
     relativePath: string;
-    staticHeaders: Record<string, any>;
     TTLInSeconds: number;
     apiFetchTimeoutInSeconds: number;
     cacheKeyHeaders?: string[];

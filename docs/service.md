@@ -117,11 +117,19 @@ To vary cache entries by a header, declare it in the manifest:
 [ServiceManifest.AUTH_PROFILE_V2]: {
     method: "GET",
     relativePath: "/v1/auth-profile",
-    staticHeaders: { apikey: API_KEY },
     TTLInSeconds: 300,
     apiFetchTimeoutInSeconds: 5,
     cacheKeyHeaders: ["x-tenant"],   // cache is keyed per tenant
 },
+```
+
+The `apikey` header is provided by the consumer at call time via `RequestContext.headers`:
+
+```ts
+await ValkeyCacheWrapper.getWithFetch(ServiceManifest.AUTH_PROFILE_V2, {
+    baseUrl: process.env.GATEWAY_URL,
+    headers: { apikey: process.env.MS_API_KEY, "x-tenant": tenantId },
+});
 ```
 
 If `cacheKeyHeaders` is omitted or empty, the key is based solely on the prefix, method, and URL.
@@ -144,7 +152,6 @@ Each service is registered in `src/config/manifest.ts` using the `ServiceManifes
 |---|---|---|
 | `method` | `HttpMethod` | HTTP method for the origin fetch |
 | `relativePath` | `string` | Path appended to the base URL. Supports `{param}` placeholders resolved at call time from `ctx.params` |
-| `staticHeaders` | `Record<string, any>` | Headers merged with request-time headers (static wins on conflict — request headers are spread first, then static) |
 | `TTLInSeconds` | `number` | Cache TTL. When `0`, cache reads are skipped but writes still occur |
 | `apiFetchTimeoutInSeconds` | `number` | Per-request timeout for the origin fetch (`AbortSignal.timeout`) |
 | `cacheKeyHeaders` | `string[]` | Optional allow-list of request headers included in the cache key. Only headers named here differentiate cache entries — all others are ignored. Omit when no header varies the response |

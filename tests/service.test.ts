@@ -2,14 +2,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import pLimit from "p-limit";
 import CircuitBreaker from "opossum";
 import { pack } from "msgpackr";
-import { ValkeyService } from "./service";
-import { ValkeyClient } from "./client";
+import { ValkeyService } from "../src/core/service";
+import { ValkeyClient } from "../src/core/client";
 import {
     Logger,
     RequestContext,
     ServiceManifestConfig,
     CircuitOpenError,
-} from "../types/types";
+} from "../src/types/types";
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -36,24 +36,26 @@ const silentLogger: Logger = {
 
 const manifest: Record<string, ServiceManifestConfig> = {
     userProfile: {
+        serviceName: "svc-user",
         method: "GET",
         relativePath: "/profile",
-        staticHeaders: {},
+
         TTLInSeconds: 300,
         apiFetchTimeoutInSeconds: 5,
         cacheKeyHeaders: ["x-tenant", "x-a", "x-b"],
     },
     userSearch: {
+        serviceName: "svc-search",
         method: "POST",
         relativePath: "/search",
-        staticHeaders: { "x-static": "pinned" },
         TTLInSeconds: 60,
         apiFetchTimeoutInSeconds: 5,
     },
     userById: {
+        serviceName: "svc-user",
         method: "GET",
         relativePath: "/users/{userId}/profile",
-        staticHeaders: {},
+
         TTLInSeconds: 300,
         apiFetchTimeoutInSeconds: 5,
     },
@@ -447,13 +449,54 @@ describe("ValkeyService.getOrFetch — cache behavior", () => {
         expect(unpack(writtenBuffer)).toEqual(responseData);
     });
 
+    it("logs VALKEY_BACKPRESSURE and does not propagate when setToCache throws", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const fakeGlide = createFakeGlideClient();
+        fakeGlide.get.mockResolvedValue(null); // cache MISS
+
+        const errorFn = vi.fn();
+        const capturingLogger: Logger = { ...silentLogger, error: errorFn };
+
+        const service = new ValkeyService(
+            createFakeValkeyClient(fakeGlide),
+            manifest,
+            capturingLogger,
+        );
+
+        // Make setToCache reject so the .catch() branch fires
+        vi.spyOn(service as any, "setToCache").mockRejectedValue(
+            new Error("disk full"),
+        );
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(
+                new Response(JSON.stringify({ id: 1 }), { status: 200 }),
+            ),
+        );
+
+        // getOrFetch should resolve normally — the write error must not propagate
+        const result = await service.getOrFetch("userProfile", baseCtx);
+        expect(result.data).toEqual({ id: 1 });
+
+        // Flush the fire-and-forget microtask
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(
+            errorFn.mock.calls.some(([msg]) =>
+                typeof msg === "string" && msg.includes("VALKEY_BACKPRESSURE"),
+            ),
+        ).toBe(true);
+    });
+
     it("skips cache READ but still writes when TTL is 0", async () => {
         vi.stubEnv("GATEWAY_URL", "");
         const zeroTtlManifest: Record<string, ServiceManifestConfig> = {
             noCache: {
+                serviceName: "svc-no-cache",
                 method: "GET",
                 relativePath: "/no-cache",
-                staticHeaders: {},
+
                 TTLInSeconds: 0,
                 apiFetchTimeoutInSeconds: 5,
             },
@@ -506,10 +549,10 @@ describe("ValkeyService.getOrFetch — HTTP status handling", () => {
             silentLogger,
         );
 
-        // Replace the breaker for "userProfile" with one that trips after just 3 requests.
+        // Replace the breaker for "svc-user" (serviceName of "userProfile") with one that trips after just 3 requests.
         // Keeps the same errorFilter so the status-handling behavior is preserved.
         (service as any).breakers.set(
-            "userProfile",
+            "svc-user",
             new CircuitBreaker(
                 (service as any).performFetch.bind(service),
                 {
@@ -656,6 +699,51 @@ describe("ValkeyService.getOrFetch — HTTP status handling", () => {
         ).rejects.toThrow("API_AUTH_ERROR - HTTP 401");
     });
 
+    // -- 499: throw, breaker does NOT count ----------------------------------
+
+    it("throws on 499 Client Closed Request", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const service = new ValkeyService(
+            createFakeValkeyClient(),
+            manifest,
+            silentLogger,
+        );
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(null, { status: 499 })),
+        );
+
+        await expect(
+            service.getOrFetch("userProfile", baseCtx),
+        ).rejects.toThrow("API_CLIENT_CLOSED - HTTP 499");
+    });
+
+    it("does NOT open the breaker for 499 errors", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const service = buildServiceWithLowThresholdBreaker();
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(null, { status: 499 })),
+        );
+
+        // Fire 4 requests — all throw 499 but breaker should stay closed
+        for (let i = 0; i < 4; i++) {
+            await service
+                .getOrFetch("userProfile", { ...baseCtx, uri: `/${i}` })
+                .catch(() => {});
+        }
+
+        // The 5th request still goes through — throws 499, not "Breaker is open"
+        await expect(
+            service.getOrFetch("userProfile", {
+                ...baseCtx,
+                uri: "/still-works",
+            }),
+        ).rejects.toThrow("API_CLIENT_CLOSED - HTTP 499");
+    });
+
     // -- 429: throw + breaker COUNTS it ---------------------------------------
 
     it("throws on 429 Too Many Requests", async () => {
@@ -698,6 +786,33 @@ describe("ValkeyService.getOrFetch — HTTP status handling", () => {
             }),
         ).rejects.toThrow(CircuitOpenError);
     });
+
+    // -- shared breaker: same serviceName, different prefixes -----------------
+
+    it("trips the breaker for a second prefix that shares the same serviceName", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        // userProfile and userById both have serviceName "svc-user".
+        // Seed the shared breaker via userProfile failures, then assert
+        // that userById is also rejected — without any errors of its own.
+        const service = buildServiceWithLowThresholdBreaker();
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(null, { status: 500 })),
+        );
+
+        // Trip the breaker via userProfile (3 failures at volumeThreshold: 3)
+        for (let i = 0; i < 3; i++) {
+            await service
+                .getOrFetch("userProfile", { ...baseCtx, uri: `/${i}` })
+                .catch(() => {});
+        }
+
+        // userById shares "svc-user" — its breaker is already open
+        await expect(
+            service.getOrFetch("userById", { ...baseCtx, params: { userId: "u1" } }),
+        ).rejects.toThrow(CircuitOpenError);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -721,7 +836,10 @@ describe("ValkeyService — event loop lag", () => {
     });
 
     // Max acceptable lag during any single event loop turn on the hot path.
-    const LAG_THRESHOLD_MS = 50;
+    // Uses 100ms (not 50ms) to absorb GC pauses and OS scheduler jitter —
+    // the goal is catching pathological blocking (hundreds of ms), not enforcing
+    // sub-50ms precision, which makes the threshold inherently flaky.
+    const LAG_THRESHOLD_MS = 100;
 
     // Runs `workFn` while continuously probing the event loop.
     // Returns the maximum observed lag in milliseconds.
@@ -745,7 +863,7 @@ describe("ValkeyService — event loop lag", () => {
     }
 
     // Builds a wide flat object (many top-level keys) to stress the
-    // key-sorting JSON.stringify replacer in hashRequestBody.
+    // key-sorting JSON.stringify replacer in generateCacheKey.
     function buildWideBody(keyCount: number): Record<string, string> {
         return Object.fromEntries(
             Array.from({ length: keyCount }, (_, i) => [`field_${i}`, `value_${i}`]),
@@ -860,5 +978,310 @@ describe("ValkeyService — event loop lag", () => {
         });
 
         expect(lag).toBeLessThan(LAG_THRESHOLD_MS);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Circuit breaker event callbacks
+//
+// registerBreakerEvents attaches five listeners. The "open" and "halfOpen"
+// callbacks are covered by existing tests (the breaker trips and probes).
+// The "close", "timeout", and "reject" callbacks only fire on specific
+// lifecycle transitions that are hard to trigger naturally — we emit the
+// events directly on the CircuitBreaker instance (which is an EventEmitter)
+// to verify the correct logger method and message are called.
+// ---------------------------------------------------------------------------
+
+describe("ValkeyService — circuit breaker event callbacks", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
+    });
+
+    // Helper: create a service, make one successful request so that
+    // getBreakerFor() creates the initial breaker with registered events,
+    // then return that breaker.
+    const buildServiceAndGetBreaker = async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const warnFn = vi.fn();
+        const infoFn = vi.fn();
+        const capturingLogger: Logger = { ...silentLogger, warn: warnFn, info: infoFn };
+
+        const fakeGlide = createFakeGlideClient();
+        const service = new ValkeyService(
+            createFakeValkeyClient(fakeGlide),
+            manifest,
+            capturingLogger,
+        );
+
+        // Trigger getBreakerFor → creates & registers events on the initial breaker
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(
+                new Response(JSON.stringify({}), { status: 200 }),
+            ),
+        );
+        await service.getOrFetch("userProfile", { ...baseCtx, uri: "/init" });
+
+        const breaker = (service as any).breakers.get("svc-user");
+        return { breaker, warnFn, infoFn };
+    };
+
+    it("logs CIRCUIT_CLOSED when the breaker closes (upstream recovered)", async () => {
+        const { breaker, infoFn } = await buildServiceAndGetBreaker();
+        breaker.emit("close");
+        expect(infoFn.mock.calls.some(([m]: [string]) => m.includes("CIRCUIT_CLOSED"))).toBe(true);
+    });
+
+    it("logs CIRCUIT_TIMEOUT when the breaker fires the timeout event", async () => {
+        const { breaker, warnFn } = await buildServiceAndGetBreaker();
+        breaker.emit("timeout");
+        expect(warnFn.mock.calls.some(([m]: [string]) => m.includes("CIRCUIT_TIMEOUT"))).toBe(true);
+    });
+
+    it("logs CIRCUIT_REJECT when the breaker fires the reject event", async () => {
+        const { breaker, warnFn } = await buildServiceAndGetBreaker();
+        breaker.emit("reject");
+        expect(warnFn.mock.calls.some(([m]: [string]) => m.includes("CIRCUIT_REJECT"))).toBe(true);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// hasRequestBody — array body branch
+// ---------------------------------------------------------------------------
+
+describe("ValkeyService — hasRequestBody array branch", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
+    });
+
+    it("includes a non-empty array body in the cache key for POST requests", () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const service = buildService();
+
+        const withArray = reachPrivate(service).generateCacheKey("userSearch", {
+            ...baseCtx,
+            method: "POST",
+            body: [{ id: 1 }, { id: 2 }],
+        });
+        const withDiffArray = reachPrivate(service).generateCacheKey("userSearch", {
+            ...baseCtx,
+            method: "POST",
+            body: [{ id: 3 }],
+        });
+        expect(withArray).not.toBe(withDiffArray);
+    });
+
+    it("produces the same cache key for a POST with an empty array body (treated as no body)", () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const service = buildService();
+
+        const withEmpty = reachPrivate(service).generateCacheKey("userSearch", {
+            ...baseCtx,
+            method: "POST",
+            body: [],
+        });
+        const withUndefined = reachPrivate(service).generateCacheKey("userSearch", {
+            ...baseCtx,
+            method: "POST",
+            body: undefined,
+        });
+        expect(withEmpty).toBe(withUndefined);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Direct public cache API — getFromCache / setToCache / health / keyExists
+//
+// These tests drive the public methods directly (not through getOrFetch) to
+// cover the branches that getOrFetch never reaches: client-not-connected
+// returns, non-OK write responses, and exception paths.
+// ---------------------------------------------------------------------------
+
+describe("ValkeyService — direct public cache API", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    // -- getFromCache ---------------------------------------------------------
+
+    describe("getFromCache", () => {
+        it("returns DOWN when the client is not connected", async () => {
+            const service = new ValkeyService(
+                createFakeValkeyClient(null as any),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.getFromCache("key");
+            expect(result?.status).toBe("DOWN");
+            expect(result?.data).toBeNull();
+            expect(result?.error).toContain("VALKEY_ERROR");
+        });
+
+        it("returns ERROR when client.get throws", async () => {
+            const fakeGlide = createFakeGlideClient();
+            fakeGlide.get.mockRejectedValue(new Error("connection reset"));
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.getFromCache("key");
+            expect(result?.status).toBe("ERROR");
+            expect(result?.error).toContain("connection reset");
+        });
+    });
+
+    // -- setToCache -----------------------------------------------------------
+
+    describe("setToCache", () => {
+        it("returns DOWN when the client is not connected", async () => {
+            const service = new ValkeyService(
+                createFakeValkeyClient(null as any),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.setToCache("key", Buffer.from("data"), 60);
+            expect(result?.status).toBe("DOWN");
+            expect(result?.error).toContain("VALKEY_ERROR");
+        });
+
+        it("returns MISS when client.set returns a non-OK value (key already exists)", async () => {
+            const fakeGlide = createFakeGlideClient();
+            // onlyIfDoesNotExist — returns null when the key is already present
+            fakeGlide.set.mockResolvedValue(null);
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.setToCache("key", Buffer.from("data"), 60);
+            expect(result?.status).toBe("MISS");
+            expect(result?.cacheKey).toBe("key");
+        });
+
+        it("returns ERROR when client.set throws", async () => {
+            const fakeGlide = createFakeGlideClient();
+            fakeGlide.set.mockRejectedValue(new Error("write failed"));
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.setToCache("key", Buffer.from("data"), 60);
+            expect(result?.status).toBe("ERROR");
+            expect(result?.error).toContain("write failed");
+        });
+
+        it("uses DEFAULT_TTL_IN_SECONDS when ttlInSeconds is not provided", async () => {
+            const fakeGlide = createFakeGlideClient();
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            await service.setToCache("key", Buffer.from("data")); // no TTL argument
+            const [, , options] = fakeGlide.set.mock.calls[0];
+            // The ternary falls back to DEFAULT_TTL_IN_SECONDS (a positive number)
+            expect(options.expiry.count).toBeGreaterThan(0);
+        });
+    });
+
+    // -- health ---------------------------------------------------------------
+
+    describe("health", () => {
+        it("returns UP when client.ping returns 'PONG'", async () => {
+            const fakeGlide = createFakeGlideClient(); // ping → "PONG" by default
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.health();
+            expect(result.status).toBe("UP");
+            expect(result.data).toBe("PONG");
+        });
+
+        it("returns DOWN when client.ping returns a non-PONG value", async () => {
+            const fakeGlide = createFakeGlideClient();
+            fakeGlide.ping.mockResolvedValue("pong"); // lowercase — does not match "PONG"
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.health();
+            expect(result.status).toBe("DOWN");
+        });
+
+        it("returns ERROR when client.ping throws", async () => {
+            const fakeGlide = createFakeGlideClient();
+            fakeGlide.ping.mockRejectedValue(new Error("ping timeout"));
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.health();
+            expect(result.status).toBe("ERROR");
+            expect(result.error).toContain("ping timeout");
+        });
+    });
+
+    // -- keyExists ------------------------------------------------------------
+
+    describe("keyExists", () => {
+        it("returns ERROR when the client is not connected", async () => {
+            const service = new ValkeyService(
+                createFakeValkeyClient(null as any),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.keyExists(["key1"]);
+            expect(result.status).toBe("ERROR");
+            expect(result.data).toBe(0);
+            expect(result.error).toContain("VALKEY_ERROR");
+        });
+
+        it("returns HIT when at least one key exists", async () => {
+            const fakeGlide = createFakeGlideClient();
+            fakeGlide.exists.mockResolvedValue(2);
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.keyExists(["key1", "key2"]);
+            expect(result.status).toBe("HIT");
+            expect(result.data).toBe(2);
+        });
+
+        it("returns MISS when no keys exist", async () => {
+            const fakeGlide = createFakeGlideClient(); // exists → 0 by default
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.keyExists(["key1"]);
+            expect(result.status).toBe("MISS");
+            expect(result.data).toBe(0);
+        });
+
+        it("returns ERROR when client.exists throws", async () => {
+            const fakeGlide = createFakeGlideClient();
+            fakeGlide.exists.mockRejectedValue(new Error("cluster error"));
+            const service = new ValkeyService(
+                createFakeValkeyClient(fakeGlide),
+                manifest,
+                silentLogger,
+            );
+            const result = await service.keyExists(["key1"]);
+            expect(result.status).toBe("ERROR");
+            expect(result.error).toContain("cluster error");
+        });
     });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { AuthConfigSchema } from "./schema";
+import { AuthConfigSchema } from "../src/config/schema";
 
 // ---------------------------------------------------------------------------
 // Helpers
