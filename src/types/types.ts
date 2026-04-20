@@ -55,6 +55,14 @@ export interface CacheKeyOptions {
     hashAlgorithm?: "md5" | "sha256" | "sha512";
 }
 
+export interface CircuitBreakerOptions {
+    volumeThreshold?: number;
+    timeout?: number;
+    errorThresholdPercentage?: number;
+    resetTimeout?: number;
+    allowWarmUp?: boolean;
+}
+
 export interface ServiceManifestConfig {
     serviceName: string,
     method: HttpMethod;
@@ -63,6 +71,7 @@ export interface ServiceManifestConfig {
     apiFetchTimeoutInSeconds: number;
     cacheKeyHeaders?: string[];
     metadata?: Record<string, string>;
+    circuitBreakerOptions?: CircuitBreakerOptions;
 }
 
 export interface RequestContext {
@@ -115,5 +124,19 @@ export class CircuitOpenError extends Error {
         super(`CIRCUIT_OPEN: ${prefix} is unavailable — circuit breaker is open`);
         this.name = "CircuitOpenError";
         this.prefix = prefix;
+    }
+}
+
+export class ValkeyConfigError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "ValkeyConfigError";
+    }
+}
+
+export class ValkeyConnectionError extends Error {
+    constructor() {
+        super("VALKEY_CONNECTION_FAILURE");
+        this.name = "ValkeyConnectionError";
     }
 }

@@ -12,11 +12,12 @@ a given change maps to a semver bump.
 
 ### Added
 
-- Nothing yet.
+- Standalone mode support: set `VALKEY_CLUSTER_MODE=false` to connect via `GlideClient` instead of `GlideClusterClient`.
+- gzip compression for cache payloads ≥1KB (`gzip(msgpack(data))`). Reads fall back to raw msgpack for keys written before this change (backward compatible rollout).
 
 ### Changed
 
-- Nothing yet.
+- Circuit breakers are now keyed per `serviceName` rather than per manifest prefix. Manifest entries sharing a `serviceName` share a single breaker, so a failing upstream trips all routes pointing at it simultaneously. Previously each prefix had an independent breaker, which meant the error threshold took longer to trigger when traffic was split across routes to the same service.
 
 ### Removed
 

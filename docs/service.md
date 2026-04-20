@@ -14,7 +14,7 @@ The main cache-aside engine of the library. It sits between consuming apps and t
 
 4. **Circuit breaking** — Wraps origin fetches in an `opossum` circuit breaker. Only 429 (rate limited) and 5xx (server errors) count toward the failure threshold. Auth errors (401/403), client closed (499), and other 4xx are filtered out. The circuit opens at 50% error rate and resets after 30 seconds.
 
-5. **Serialization** — Cache entries are stored as msgpack (`msgpackr`) instead of raw JSON. This is more compact on disk/memory in Valkey and faster to deserialize on cache hits (`unpack` vs `JSON.parse`).
+5. **Serialization** — Cache entries are serialized with msgpack (`msgpackr`). Payloads ≥1KB are additionally gzip-compressed before writing (`gzip(msgpack(data))`). On read, the service attempts gunzip first and falls back to raw msgpack (for keys written before the compression rollout). This is more compact on disk/memory in Valkey and faster to deserialize on cache hits (`unpack` vs `JSON.parse`).
 
 6. **Graceful degradation** — When Valkey is down, the service falls through to the origin fetch transparently. Cache writes that fail are caught and logged, never thrown to callers.
 
@@ -35,7 +35,7 @@ getOrFetch(prefix, ctx)
                       |
                 +--[connected + TTL > 0]--> getFromCache()
                 |                               |
-                |                        [HIT] --> unpack(msgpack), return
+                |                        [HIT] --> gunzip (if >=1KB), unpack(msgpack), return
                 |                               |
                 |                        [MISS] --> continue to origin fetch
                 |
@@ -53,7 +53,11 @@ getOrFetch(prefix, ctx)
                                 |
                          [2xx]-------> JSON.parse response
                                 |        |
-                                |   [connected]--> pack(msgpack), setToCache (fire-and-forget)
+                                |   [connected]--> pack(msgpack)
+                                |        |           |
+                                |        |    [>=1KB]--> gzip(packed)
+                                |        |           |
+                                |        +---------> setToCache (fire-and-forget)
                                 |        |
                                 |        v
                                 |     return { data, upstreamStatus }
@@ -100,7 +104,7 @@ The cache key is built from multiple request attributes to ensure uniqueness:
 Where the SHA-256 input is:
 
 ```
-{prefix}:{method}:{resolvedUrl}|headers:{sorted_header_pairs}|requestBody:{body_sha256}
+{prefix}:{method}:{resolvedUrl}|headers:{sorted_header_pairs}|requestBody:{canonical_json}
 ```
 
 Where `resolvedUrl` is the output of `buildUpstreamUrl` — base + path-param-resolved relativePath + optional uri + sorted query string.
@@ -141,7 +145,7 @@ Headers are sorted alphabetically before hashing. This means `{a: "1", b: "2"}` 
 ### Request body handling
 
 - GET requests never include the body in the key (even if one is present).
-- For other methods, the body is JSON-serialized with sorted keys at every nesting level (`JSON.stringify` with a replacer), then SHA-256 hashed. This ensures `{a:1, b:2}` and `{b:2, a:1}` produce identical keys.
+- For other methods, the body is JSON-serialized with sorted keys at every nesting level (`JSON.stringify` with a replacer) and appended as-is to the raw key string, which is then SHA-256 hashed as a whole. This ensures `{a:1, b:2}` and `{b:2, a:1}` produce identical keys.
 - Null, undefined, empty objects, and empty arrays are treated as "no body".
 
 ## Services manifest
@@ -150,12 +154,14 @@ Each service is registered in `src/config/manifest.ts` using the `ServiceManifes
 
 | Field | Type | Description |
 |---|---|---|
+| `serviceName` | `string` | Logical upstream service name. Manifest entries sharing a `serviceName` share a single circuit breaker — when one trips, all routes to that service are blocked together |
 | `method` | `HttpMethod` | HTTP method for the origin fetch |
 | `relativePath` | `string` | Path appended to the base URL. Supports `{param}` placeholders resolved at call time from `ctx.params` |
 | `TTLInSeconds` | `number` | Cache TTL. When `0`, cache reads are skipped but writes still occur |
 | `apiFetchTimeoutInSeconds` | `number` | Per-request timeout for the origin fetch (`AbortSignal.timeout`) |
 | `cacheKeyHeaders` | `string[]` | Optional allow-list of request headers included in the cache key. Only headers named here differentiate cache entries — all others are ignored. Omit when no header varies the response |
 | `metadata` | `Record<string, string>` | Optional metadata (not used in fetch or caching logic) |
+| `circuitBreakerOptions` | `CircuitBreakerOptions` | Optional per-entry overrides for the shared circuit breaker defaults (`volumeThreshold`, `timeout`, `errorThresholdPercentage`, `resetTimeout`, `allowWarmUp`) |
 
 ## Public API
 
@@ -199,7 +205,7 @@ How `performFetch` handles each upstream response status:
 
 ## Circuit breaker configuration
 
-Each manifest entry gets its own independent circuit breaker, created lazily on first use via `getBreakerFor(prefix)`. A failing endpoint only trips its own breaker — other endpoints are unaffected.
+Circuit breakers are keyed by `serviceName`, not by manifest prefix, and created lazily on first use via `getBreakerFor(prefix)`. Manifest entries that share a `serviceName` share a single breaker — when one trips, all routes pointing at the same upstream are blocked together. Routes with different `serviceName` values are unaffected.
 
 All breakers share the same configuration:
 
@@ -257,7 +263,7 @@ Each breaker emits log entries on state transitions via `registerBreakerEvents`:
 
 ### TTL=0 skips reads but not writes
 
-When a manifest entry has `TTLInSeconds: 0`, the cache read is skipped (line 302 — gated by `manifest.TTLInSeconds > 0`), but the cache write still executes (line 335 — gated only by `isConnected`). This means data is written to Valkey with the default TTL even when reads are disabled. This is an intentional asymmetry — it pre-warms the cache so that toggling the TTL back to a positive value immediately starts serving hits.
+When a manifest entry has `TTLInSeconds: 0`, the cache read is skipped (gated by `manifest.TTLInSeconds > 0`), but the cache write still executes (gated only by `isConnected`). This means data is written to Valkey with the default TTL even when reads are disabled. This is an intentional asymmetry — it pre-warms the cache so that toggling the TTL back to a positive value immediately starts serving hits.
 
 ### `onlyIfDoesNotExist` write semantics
 

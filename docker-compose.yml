@@ -1,0 +1,136 @@
+# =============================================================================
+# docker-compose.yml
+#
+# Real Valkey + mock upstream + benchmark runner.
+# Two profiles matching your typical k8s pod sizes:
+#
+#   small    → 512MB memory, 0.5 CPU  (V8 heap capped at 384MB)
+#   standard → 1GB memory,  1.0 CPU  (V8 heap capped at 896MB)
+#
+# Tune payload size, latency, and duration in bench.env — changes there
+# are picked up by all services automatically.
+#
+# Usage:
+#   docker compose --profile small    up --build --abort-on-container-exit
+#   docker compose --profile standard up --build --abort-on-container-exit
+#
+# After the run, generate the HTML report locally:
+#   npx tsx benchmarks/report.ts && open benchmarks/report.html
+# =============================================================================
+
+services:
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    profiles: [small, standard]
+    command: >
+      valkey-server
+      --requirepass benchmarkpass
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "benchmarkpass", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
+  mock-server:
+    build:
+      context: .
+      dockerfile: benchmarks/Dockerfile
+    profiles: [small, standard]
+    command: npx tsx benchmarks/mock-server.ts
+    env_file: bench.env
+    environment:
+      MOCK_PORT: "4000"
+
+  # -------------------------------------------------------------------------
+  # small — mirrors a constrained k8s pod (512MB / 0.5 CPU)
+  # -------------------------------------------------------------------------
+  benchmark-small:
+    build:
+      context: .
+      dockerfile: benchmarks/Dockerfile
+    profiles: [small]
+    command: >
+      sh -c "sleep 2 &&
+             node --max-old-space-size=384 ./node_modules/.bin/tsx benchmarks/run.ts &&
+             npx tsx benchmarks/report.ts"
+    depends_on:
+      valkey:
+        condition: service_healthy
+      mock-server:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+        reservations:
+          memory: 256m
+          cpus: "0.25"
+    env_file: bench.env
+    environment:
+      MODE: "real"
+      CONCURRENCY: "100"
+      BASE_URL: "http://mock-server:4000"
+      VALKEY_HOST: "valkey"
+      VALKEY_PORT: "6379"
+      VALKEY_USERNAME: "default"
+      VALKEY_PASSWORD: "benchmarkpass"
+      VALKEY_USE_TLS: "false"
+      VALKEY_CLUSTER_MODE: "false"
+      NODE_APP_INSTANCE: "benchmark"
+      NODE_OPTIONS: "--max-old-space-size=384"
+      CONTAINER_MEMORY_LIMIT: "512m"
+      CONTAINER_CPU_LIMIT: "0.5"
+      V8_HEAP_LIMIT_MB: "384"
+      KEY_POOL_SIZE: "${KEY_POOL_SIZE:-500}"
+    volumes:
+      - ./benchmarks:/app/benchmarks
+
+  # -------------------------------------------------------------------------
+  # standard — mirrors a standard k8s pod (1GB / 1 CPU)
+  # -------------------------------------------------------------------------
+  benchmark-standard:
+    build:
+      context: .
+      dockerfile: benchmarks/Dockerfile
+    profiles: [standard]
+    command: >
+      sh -c "sleep 2 &&
+             node --max-old-space-size=896 ./node_modules/.bin/tsx benchmarks/run.ts &&
+             npx tsx benchmarks/report.ts"
+    depends_on:
+      valkey:
+        condition: service_healthy
+      mock-server:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+        reservations:
+          memory: 512m
+          cpus: "0.5"
+    env_file: bench.env
+    environment:
+      MODE: "real"
+      CONCURRENCY: "200"
+      BASE_URL: "http://mock-server:4000"
+      VALKEY_HOST: "valkey"
+      VALKEY_PORT: "6379"
+      VALKEY_USERNAME: "default"
+      VALKEY_PASSWORD: "benchmarkpass"
+      VALKEY_USE_TLS: "false"
+      VALKEY_CLUSTER_MODE: "false"
+      NODE_APP_INSTANCE: "benchmark"
+      NODE_OPTIONS: "--max-old-space-size=896"
+      CONTAINER_MEMORY_LIMIT: "1g"
+      CONTAINER_CPU_LIMIT: "1.0"
+      V8_HEAP_LIMIT_MB: "896"
+      KEY_POOL_SIZE: "${KEY_POOL_SIZE:-500}"
+      PROFILE: "${PROFILE:-0}"
+    volumes:
+      - ./benchmarks:/app/benchmarks

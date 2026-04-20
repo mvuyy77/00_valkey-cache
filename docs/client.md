@@ -2,7 +2,7 @@
 
 `src/core/client.ts`
 
-A lazy, singleton-style wrapper around `@valkey/valkey-glide`'s `GlideClusterClient`. It handles config validation, connection lifecycle, and error recovery so that the rest of the library never touches glide directly.
+A lazy, singleton-style wrapper around `@valkey/valkey-glide`'s `GlideClusterClient` (cluster mode) or `GlideClient` (standalone mode). It handles config validation, connection lifecycle, and error recovery so that the rest of the library never touches glide directly.
 
 ## Responsibilities
 
@@ -12,15 +12,16 @@ A lazy, singleton-style wrapper around `@valkey/valkey-glide`'s `GlideClusterCli
 
 3. **Connection deduplication** - If multiple callers invoke `connect()` concurrently (common during app startup when several `getOrFetch` calls land at the same time), they all share a single in-flight `createClient` promise. Only one connection is ever opened.
 
-4. **Graceful degradation** - When Valkey is unreachable or misconfigured, `connect()` returns `null` rather than throwing. Callers (primarily `ValkeyService`) use this to fall back to origin fetches without the cache layer.
+4. **Graceful degradation** - When Valkey is unreachable or misconfigured, `connect()` throws `ValkeyConnectionError` or `ValkeyConfigError`. Callers (primarily `ValkeyService`) catch these errors to fall back to origin fetches without the cache layer.
 
 ## Environment variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `VALKEY_HOST` | Yes | `""` | Hostname of the Valkey cluster endpoint |
+| `VALKEY_HOST` | Yes | `""` | Hostname of the Valkey endpoint |
 | `VALKEY_PORT` | Yes | `""` | Port number (coerced from string to int by Zod) |
 | `VALKEY_USE_TLS` | No | `"true"` | Set to `"false"` to disable TLS |
+| `VALKEY_CLUSTER_MODE` | No | `"true"` | Set to `"false"` to connect in standalone mode (uses `GlideClient` instead of `GlideClusterClient`) |
 | `VALKEY_USERNAME` | No | - | Credentials for authenticated clusters |
 | `VALKEY_PASSWORD` | No | - | Credentials for authenticated clusters |
 | `NODE_APP_INSTANCE` | No | `"development"` | When `"development"` or `"local"`, TLS certificate verification is disabled (`tlsInsecure: true`) |
@@ -46,7 +47,8 @@ A lazy, singleton-style wrapper around `@valkey/valkey-glide`'s `GlideClusterCli
                               |                        |
                               |                 [now valid] --> config stored, continue ↓
                               |
-                              +--[first call]-----> GlideClusterClient.createClient(config)
+                              +--[first call]-----> GlideClusterClient.createClient(config)  [cluster mode]
+                              |                    GlideClient.createClient(config)         [standalone mode]
                               |                          |
                               |                   [success] --> client cached, returned
                               |                          |
@@ -68,9 +70,9 @@ A lazy, singleton-style wrapper around `@valkey/valkey-glide`'s `GlideClusterCli
 
 Validates environment variables immediately. Logs `VALKEY_CONFIG_VALIDATED` on success or an error on failure. Does **not** open a connection.
 
-### `connect(): Promise<GlideClusterClient | null>`
+### `connect(): Promise<GlideClient | GlideClusterClient>`
 
-Returns a connected glide client, or `null` if Valkey is unavailable. Safe to call repeatedly - the first call creates the connection, subsequent calls return the cached instance.
+Returns a connected glide client. Throws `ValkeyConfigError` if env vars are invalid, or `ValkeyConnectionError` if the connection fails. Safe to call repeatedly — the first call creates the connection, subsequent calls return the cached instance.
 
 ### `disconnect(): Promise<void>`
 
@@ -89,6 +91,7 @@ The client configures the glide connection with the following settings:
 | `connectionBackoff` | 5 retries, exponential (base 2, factor 1000ms, 20% jitter) | Automatic reconnect on transient failures |
 | `credentials` | Included only when both `VALKEY_USERNAME` and `VALKEY_PASSWORD` are set | Supports both authenticated and open clusters |
 | `tlsInsecure` | `true` in dev/local, `false` otherwise | Allows self-signed certs in non-production environments |
+| Client type | `GlideClusterClient` when `VALKEY_CLUSTER_MODE=true` (default); `GlideClient` when `false` | Both modes set `lazyConnect` from config |
 
 ## Known behavior: self-healing config validation
 
@@ -98,7 +101,7 @@ See the test `"self-heals when env vars become available after construction"` in
 
 ## Known behavior: auto-retry on connection failure
 
-When `GlideClusterClient.createClient` fails, `initializeValkeyConnection` catches the error, clears `clientPromise`, and returns `null`. Because the promise is cleared, the next `connect()` call creates a fresh connection attempt automatically — no `disconnect()` required.
+When `GlideClusterClient.createClient` fails, `initializeValkeyConnection` catches the error, clears `clientPromise`, and re-throws as `ValkeyConnectionError`. `getClient()` also clears `clientPromise` before re-throwing, so the next `connect()` call creates a fresh connection attempt automatically — no `disconnect()` required.
 
 Retry storms are not a concern here because glide's `connectionBackoff` config (5 retries, exponential backoff, 20% jitter) already throttles retries within a single `createClient` call. The auto-retry only controls whether the *next external* `connect()` tries again or gives up permanently.
 

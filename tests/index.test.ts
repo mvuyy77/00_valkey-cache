@@ -4,7 +4,7 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 // code never attempts a real Valkey connection.
 vi.mock("../src/core/client", () => {
     const MockValkeyClient = vi.fn(function (this: any) {
-        this.connect = vi.fn().mockResolvedValue(null); // simulates Valkey DOWN
+        this.connect = vi.fn().mockRejectedValue(new Error("VALKEY_CONNECTION_FAILURE")); // simulates Valkey DOWN
         this.disconnect = vi.fn().mockResolvedValue(undefined);
     });
     return { ValkeyClient: MockValkeyClient };

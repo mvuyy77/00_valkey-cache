@@ -9,6 +9,7 @@ import {
     RequestContext,
     ServiceManifestConfig,
     CircuitOpenError,
+    ValkeyConnectionError,
 } from "../src/types/types";
 
 // ---------------------------------------------------------------------------
@@ -291,6 +292,12 @@ const createFakeGlideClient = () => ({
 const createFakeValkeyClient = (glideClient = createFakeGlideClient()) =>
     ({
         connect: vi.fn().mockResolvedValue(glideClient),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+    }) as unknown as ValkeyClient;
+
+const createDownValkeyClient = () =>
+    ({
+        connect: vi.fn().mockRejectedValue(new ValkeyConnectionError()),
         disconnect: vi.fn().mockResolvedValue(undefined),
     }) as unknown as ValkeyClient;
 
@@ -982,6 +989,80 @@ describe("ValkeyService — event loop lag", () => {
 });
 
 // ---------------------------------------------------------------------------
+// performFetch — method and timeout sourcing
+// ---------------------------------------------------------------------------
+
+describe("ValkeyService — performFetch method and timeout", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
+    });
+
+    it("uses manifest.method for the fetch regardless of ctx.method", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const service = new ValkeyService(
+            createFakeValkeyClient(),
+            manifest,
+            silentLogger,
+        );
+
+        const fetchMock = vi.fn().mockResolvedValue(
+            new Response(JSON.stringify({}), { status: 200 }),
+        );
+        vi.stubGlobal("fetch", fetchMock);
+
+        // userSearch manifest.method is "POST", but ctx omits method
+        await service.getOrFetch("userSearch", { ...baseCtx, method: undefined });
+
+        expect(fetchMock).toHaveBeenCalledWith(
+            expect.any(String),
+            expect.objectContaining({ method: "POST" }),
+        );
+    });
+
+    it("uses manifest.apiFetchTimeoutInSeconds when ctx does not specify a timeout", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+
+        const service = new ValkeyService(
+            createFakeValkeyClient(),
+            manifest,
+            silentLogger,
+        );
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })),
+        );
+
+        // manifest.userProfile.apiFetchTimeoutInSeconds is 5 → expect 5000ms
+        await service.getOrFetch("userProfile", { ...baseCtx, apiFetchTimeoutInSeconds: undefined });
+
+        expect(timeoutSpy).toHaveBeenCalledWith(5000);
+    });
+
+    it("uses ctx.apiFetchTimeoutInSeconds over manifest when provided", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+
+        const service = new ValkeyService(
+            createFakeValkeyClient(),
+            manifest,
+            silentLogger,
+        );
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })),
+        );
+
+        // Consumer overrides to 10s — should win over manifest's 5s
+        await service.getOrFetch("userProfile", { ...baseCtx, apiFetchTimeoutInSeconds: 10 });
+
+        expect(timeoutSpy).toHaveBeenCalledWith(10000);
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Circuit breaker event callbacks
 //
 // registerBreakerEvents attaches five listeners. The "open" and "halfOpen"
@@ -1111,7 +1192,7 @@ describe("ValkeyService — direct public cache API", () => {
     describe("getFromCache", () => {
         it("returns DOWN when the client is not connected", async () => {
             const service = new ValkeyService(
-                createFakeValkeyClient(null as any),
+                createDownValkeyClient(),
                 manifest,
                 silentLogger,
             );
@@ -1140,7 +1221,7 @@ describe("ValkeyService — direct public cache API", () => {
     describe("setToCache", () => {
         it("returns DOWN when the client is not connected", async () => {
             const service = new ValkeyService(
-                createFakeValkeyClient(null as any),
+                createDownValkeyClient(),
                 manifest,
                 silentLogger,
             );
@@ -1236,7 +1317,7 @@ describe("ValkeyService — direct public cache API", () => {
     describe("keyExists", () => {
         it("returns ERROR when the client is not connected", async () => {
             const service = new ValkeyService(
-                createFakeValkeyClient(null as any),
+                createDownValkeyClient(),
                 manifest,
                 silentLogger,
             );

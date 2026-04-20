@@ -11,7 +11,7 @@ when deciding the version bump for a PR.
 |---|---|---|
 | Add a new entry to `SERVICES_MANIFEST` | **minor** | Purely additive — no existing consumer is affected. |
 | Add a new value to the `ServiceManifest` enum (with matching manifest entry) | **minor** | Additive type surface. |
-| Change `relativePath`, `method`, `TTLInSeconds`, `staticHeaders`, or `apiFetchTimeoutInSeconds` on an existing entry | **major** | Consumers calling that key will observe different upstream behavior, different cache lifetimes, or different headers. This is a silent behavior change — force consumers to read the changelog. |
+| Change `relativePath`, `method`, `TTLInSeconds`, or `apiFetchTimeoutInSeconds` on an existing entry | **major** | Consumers calling that key will observe different upstream behavior or different cache lifetimes. This is a silent behavior change — force consumers to read the changelog. |
 | Remove an entry from `SERVICES_MANIFEST` or a value from the enum | **major** | Calls against the removed key will throw `PREFIX_NOT_FOUND` at runtime. |
 | Change a public type in `src/types/types.ts` in a non-additive way | **major** | Breaks consumer compile. |
 | Add a new public type or field (optional) in `src/types/types.ts` | **minor** | Additive. |

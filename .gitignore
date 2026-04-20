@@ -6,6 +6,7 @@ dist/
 
 # Environment
 .env
+.env.dev
 .env.local
 .env.*.local
 
@@ -25,3 +26,11 @@ coverage/
 
 # Playground
 src/playground/*
+
+# Benchmark artifacts
+benchmarks/k6/results/*.json
+benchmarks/k6/results/*.html
+benchmarks/report*html
+benchmarks/result*json
+
+.github

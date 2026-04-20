@@ -1,4 +1,8 @@
 import { createHash } from "node:crypto";
+import { gunzip, gzip } from "node:zlib";
+import { promisify } from "node:util";
+const gunzipAsync = promisify(gunzip);
+const gzipAsync = promisify(gzip);
 import pLimit from "p-limit";
 import CircuitBreaker from "opossum";
 import { pack, unpack } from "msgpackr";
@@ -21,7 +25,9 @@ import { ValkeyClient } from "./client";
 
 export class ValkeyService {
 	private requestsInFlight = new Map<string, Promise<any>>();
+	// 100 concurrent ops keeps service-layer load well under the connection's inflightRequestsLimit (700).
 	private limit = pLimit(100);
+	// Requests beyond the 100 concurrent slots queue here; reject once queue exceeds this to shed load early.
 	private MAX_QUEUE_SIZE = 500;
 	private breakers = new Map<string, CircuitBreaker>();
 
@@ -32,7 +38,8 @@ export class ValkeyService {
 	) {}
 
 	private getBreakerFor(prefix: string): CircuitBreaker {
-		const serviceName = this.manifest[prefix].serviceName;
+		const config = this.manifest[prefix];
+		const serviceName = config.serviceName;
 		let breaker = this.breakers.get(serviceName);
 		if (!breaker) {
 			breaker = new CircuitBreaker(this.performFetch, {
@@ -41,6 +48,7 @@ export class ValkeyService {
 				timeout: 10000, // If a request takes longer than 10 seconds, it’s treated as a failure.
 				errorThresholdPercentage: 50, // If half of the requests fail, the breaker "trips" (opens), and further calls are blocked immediately to give the service a break.
 				resetTimeout: 30000, // Once tripped, the breaker stays open for 30 seconds before trying again.
+				...config.circuitBreakerOptions,
 				// Only 429 and 5xx count as breaker failures.
 				// 401, 403, 499 are thrown but filtered — not the upstream’s fault.
 				errorFilter: (err: any) => err.status && err.status !== 429 && err.status < 500,
@@ -103,17 +111,19 @@ export class ValkeyService {
 		cacheKey: string,
 	): Promise<CacheReadResult<Buffer> | null> {
 		const startTime = Date.now();
+		let client;
 		try {
-			const client = await this.client.connect();
-			if (!client) {
-				return {
-					status: "DOWN",
-					data: null,
-					timeElapsed: this.calculateTimeElapsed(startTime),
-					error: "VALKEY_ERROR - not connected to Valkey",
-				};
-			}
+			client = await this.client.connect();
+		} catch {
+			return {
+				status: "DOWN",
+				data: null,
+				timeElapsed: this.calculateTimeElapsed(startTime),
+				error: "VALKEY_ERROR - not connected to Valkey",
+			};
+		}
 
+		try {
 			const cachedValue = (await client.get(cacheKey, {
 				decoder: Decoder.Bytes,
 			})) as Buffer | null;
@@ -149,8 +159,10 @@ export class ValkeyService {
 		ttlInSeconds?: number,
 	): Promise<CacheWriteResult | null> {
 		const startTime = Date.now();
-		const client = await this.client.connect();
-		if (!client) {
+		let client;
+		try {
+			client = await this.client.connect();
+		} catch {
 			return {
 				cacheKey,
 				status: "DOWN",
@@ -194,17 +206,19 @@ export class ValkeyService {
 
 	public async health(): Promise<HealthCheckResult> {
 		const startTime = Date.now();
+		let client;
 		try {
-			const client = await this.client.connect();
-			if (!client) {
-				return {
-					status: "DOWN",
-					data: null,
-					timeElapsed: this.calculateTimeElapsed(startTime),
-					error: "VALKEY_ERROR - not connected to Valkey",
-				};
-			}
+			client = await this.client.connect();
+		} catch {
+			return {
+				status: "DOWN",
+				data: null,
+				timeElapsed: this.calculateTimeElapsed(startTime),
+				error: "VALKEY_ERROR - not connected to Valkey",
+			};
+		}
 
+		try {
 			const response = await client.ping();
 			return {
 				status: response === "PONG" ? "UP" : "DOWN",
@@ -224,8 +238,10 @@ export class ValkeyService {
 
 	public async keyExists(cacheKey: string[]): Promise<KeyExistsResult> {
 		const startTime = Date.now();
-		const client = await this.client.connect();
-		if (!client) {
+		let client;
+		try {
+			client = await this.client.connect();
+		} catch {
 			return {
 				status: "ERROR",
 				data: 0,
@@ -253,8 +269,10 @@ export class ValkeyService {
 
 	public async getStats(): Promise<ValkeyStats> {
 		const startTime = Date.now();
-		const client = await this.client.connect();
-		if (!client) {
+		let client;
+		try {
+			client = await this.client.connect();
+		} catch {
 			return {
 				status: "DOWN",
 				data: null,
@@ -266,7 +284,7 @@ export class ValkeyService {
 		try {
 			const stats = client.getStatistics();
 			return {
-				status: stats ? "HIT" : "MISS",
+				status: "OK",
 				data: stats,
 				timeElapsed: this.calculateTimeElapsed(startTime),
 				error: null,
@@ -352,17 +370,28 @@ export class ValkeyService {
 		const fetchInProgress = (async (): Promise<FetchResult<T>> => {
 			try {
 				const startTime = Date.now();
-				const connectedClient = await this.client.connect();
-				const isConnected = connectedClient !== null;
+				let isConnected = false;
+				try {
+					await this.client.connect();
+					isConnected = true;
+				} catch {
+					// Valkey unavailable — proceed without cache
+				}
 				if (isConnected && manifest.TTLInSeconds > 0) {
 					const readFromCache = await this.getFromCache(cacheKey);
 					if (readFromCache?.status === "HIT" && readFromCache.data) {
 						this.logger.debug(
 							`VALKEY_CACHE_HIT: ${prefix} - time elapsed: ${this.calculateTimeElapsed(startTime)}`,
 						);
-						// Data is stored as msgpack — unpack is faster than JSON.parse
-						// and avoids converting the Buffer to a string first.
-						return { data: unpack(readFromCache.data) as T };
+						// Data is stored as gzip(msgpack). During rollout, old keys may
+						// still be raw msgpack — fall back to unpack without decompress.
+						let raw: Buffer;
+						try {
+							raw = await gunzipAsync(readFromCache.data);
+						} catch {
+							raw = readFromCache.data;
+						}
+						return { data: unpack(raw) as T };
 					}
 				}
 
@@ -393,15 +422,19 @@ export class ValkeyService {
 				const parsed = JSON.parse(result.data.toString()) as T;
 
 				if (isConnected) {
-					// Store as msgpack instead of raw JSON bytes:
-					// - more compact on disk/memory in Valkey
-					// - faster to deserialize on cache HITs (unpack vs JSON.parse)
-					const packed = Buffer.from(pack(parsed));
-					this.setToCache(
-						cacheKey,
-						packed,
-						this.manifest[prefix].TTLInSeconds,
-					).catch((error) => {
+					// Pack + gzip + write runs entirely in the background so the caller
+					// gets their data immediately. gzipSync was blocking the event loop
+					// for the full compression duration on every cache miss — at large
+					// payload sizes (e.g. 1MB) under high concurrency this compounded
+					// into multi-second event loop stalls and request timeouts.
+					const ttl = this.manifest[prefix].TTLInSeconds;
+					(async () => {
+						const packed = pack(parsed);
+						const cachePayload = packed.byteLength >= 1024
+							? await gzipAsync(packed, { level: 1 })
+							: packed;
+						await this.setToCache(cacheKey, cachePayload, ttl);
+					})().catch((error) => {
 						this.logger.error(
 							`VALKEY_BACKPRESSURE: Cache write failed for key - ${cacheKey}`,
 							error.message,
@@ -429,15 +462,16 @@ export class ValkeyService {
 		prefix: string,
 		options: RequestContext,
 	): Promise<{ status: number; data: Buffer | null }> => {
+		const manifest = this.manifest[prefix];
 		const fetchUrl = this.buildUpstreamUrl(prefix, options);
 		const response = await fetch(fetchUrl, {
-			method: options.method,
+			method: manifest.method,
 			headers: {
 				...options.headers,
 			},
 			body: options.body ? JSON.stringify(options.body) : undefined,
 			signal: AbortSignal.timeout(
-				(options.apiFetchTimeoutInSeconds || 5) * 1000,
+				(options.apiFetchTimeoutInSeconds ?? manifest.apiFetchTimeoutInSeconds) * 1000,
 			),
 		});
 

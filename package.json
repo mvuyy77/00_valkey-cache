@@ -4,13 +4,22 @@
   "main": "index.js",
   "scripts": {
     "build": "tsdown",
+    "dev:up": "docker compose -f docker-compose.dev.yml up -d",
+    "dev:mock": "tsx scripts/mock-server.ts",
+    "dev": "npm run dev:up && tsx --env-file .env.dev scripts/dev.ts",
+    "dev:watch": "npm run dev:up && tsx --env-file .env.dev watch scripts/dev.ts",
+    "dev:reset": "docker compose -f docker-compose.dev.yml exec valkey valkey-cli flushall",
+    "dev:down": "docker compose -f docker-compose.dev.yml down",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "benchmark": "tsx benchmarks/bench.ts",
     "bench:small": "docker compose --profile small up --build --abort-on-container-exit",
-    "bench:standard": "docker compose --profile standard up --build --abort-on-container-exit"
+    "bench:standard": "docker compose --profile standard up --build --abort-on-container-exit",
+    "bench:k6": "docker compose -f docker-compose.k6.yml --profile mock up --build --abort-on-container-exit && node benchmarks/k6/report.mjs",
+    "bench:k6:real": "docker compose -f docker-compose.k6.yml --profile real up --build --abort-on-container-exit && node benchmarks/k6/report.mjs",
+    "bench:k6:report": "node benchmarks/k6/report.mjs"
   },
   "author": "",
   "license": "ISC",

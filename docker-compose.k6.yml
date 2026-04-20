@@ -1,0 +1,184 @@
+# =============================================================================
+# docker-compose.k6.yml — k6 load testing against the library via HTTP
+#
+# Architecture:
+#   k6 → app-server (Node.js + ValkeyService) → valkey (cache)
+#                                               → mock-server (upstream)
+#
+# The app-server wraps ValkeyService in an HTTP server, exactly as consumers
+# use the library in production. k6 generates load from outside the process,
+# measuring true end-to-end latency including HTTP overhead.
+#
+# Profiles:
+#   mock    → upstream is the mock-server (repeatable, deterministic)
+#   real    → upstream is a real service (set UPSTREAM_URL in env)
+#
+# Usage:
+#   # Against mock upstream (default):
+#   docker compose -f docker-compose.k6.yml --profile mock up --build --abort-on-container-exit
+#
+#   # Against a real upstream:
+#   UPSTREAM_URL=https://api.example.com docker compose -f docker-compose.k6.yml --profile real up --build --abort-on-container-exit
+#
+#   # Tune parameters:
+#   K6_VUS=400 K6_DURATION=60s docker compose -f docker-compose.k6.yml --profile mock up --build --abort-on-container-exit
+#
+# Results: benchmarks/k6/results/k6-results.json
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Valkey — shared by all profiles
+  # ---------------------------------------------------------------------------
+  valkey:
+    image: valkey/valkey:8-alpine
+    profiles: [mock, real]
+    command: >
+      valkey-server
+      --requirepass benchmarkpass
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "valkey-cli", "-a", "benchmarkpass", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Mock upstream — only used in "mock" profile
+  # ---------------------------------------------------------------------------
+  mock-server:
+    build:
+      context: .
+      dockerfile: benchmarks/Dockerfile
+    profiles: [mock]
+    command: npx tsx benchmarks/mock-server.ts
+    env_file: bench.env
+    environment:
+      MOCK_PORT: "4000"
+
+  # ---------------------------------------------------------------------------
+  # App server (mock profile) — wraps ValkeyService in HTTP, upstream = mock
+  # ---------------------------------------------------------------------------
+  app-server-mock:
+    build:
+      context: .
+      dockerfile: benchmarks/k6/Dockerfile.app
+    profiles: [mock]
+    depends_on:
+      valkey:
+        condition: service_healthy
+      mock-server:
+        condition: service_started
+    volumes:
+      - ./benchmarks/k6/results:/results
+    deploy:
+      resources:
+        limits:
+          memory: ${APP_MEMORY:-1g}
+          cpus: "${APP_CPUS:-1.0}"
+        reservations:
+          memory: 512m
+          cpus: "0.5"
+    env_file: bench.env
+    environment:
+      PORT: "3000"
+      BASE_URL: "http://mock-server:4000"
+      VALKEY_HOST: "valkey"
+      VALKEY_PORT: "6379"
+      VALKEY_USERNAME: "default"
+      VALKEY_PASSWORD: "benchmarkpass"
+      VALKEY_USE_TLS: "false"
+      VALKEY_CLUSTER_MODE: "false"
+      NODE_APP_INSTANCE: "benchmark"
+      NODE_OPTIONS: "--max-old-space-size=${APP_HEAP_MB:-896}"
+      LOG_LEVEL: "${LOG_LEVEL:-error}"
+      CONTAINER_MEMORY_LIMIT: "${APP_MEMORY:-1g}"
+      CONTAINER_CPU_LIMIT: "${APP_CPUS:-1.0}"
+
+  # ---------------------------------------------------------------------------
+  # App server (real profile) — wraps ValkeyService in HTTP, upstream = real
+  # ---------------------------------------------------------------------------
+  app-server-real:
+    build:
+      context: .
+      dockerfile: benchmarks/k6/Dockerfile.app
+    profiles: [real]
+    depends_on:
+      valkey:
+        condition: service_healthy
+    volumes:
+      - ./benchmarks/k6/results:/results
+    deploy:
+      resources:
+        limits:
+          memory: ${APP_MEMORY:-1g}
+          cpus: "${APP_CPUS:-1.0}"
+        reservations:
+          memory: 512m
+          cpus: "0.5"
+    environment:
+      PORT: "3000"
+      BASE_URL: "${UPSTREAM_URL:-}"
+      VALKEY_HOST: "valkey"
+      VALKEY_PORT: "6379"
+      VALKEY_USERNAME: "default"
+      VALKEY_PASSWORD: "benchmarkpass"
+      VALKEY_USE_TLS: "false"
+      VALKEY_CLUSTER_MODE: "false"
+      NODE_APP_INSTANCE: "benchmark"
+      NODE_OPTIONS: "--max-old-space-size=${APP_HEAP_MB:-896}"
+      LOG_LEVEL: "${LOG_LEVEL:-error}"
+      CONTAINER_MEMORY_LIMIT: "${APP_MEMORY:-1g}"
+      CONTAINER_CPU_LIMIT: "${APP_CPUS:-1.0}"
+
+  # ---------------------------------------------------------------------------
+  # k6 — load generator (mock profile)
+  # ---------------------------------------------------------------------------
+  k6-mock:
+    image: grafana/k6:latest
+    profiles: [mock]
+    depends_on:
+      app-server-mock:
+        condition: service_healthy
+    volumes:
+      - ./benchmarks/k6:/scripts
+      - ./benchmarks/k6/results:/results
+    environment:
+      K6_OUT: "json=/results/k6-raw.json"
+      K6_WEB_DASHBOARD: "true"
+      K6_WEB_DASHBOARD_EXPORT: "/results/report.html"
+    command: >
+      run
+      --env TARGET=http://app-server-mock:3000
+      --env VUS=${K6_VUS:-200}
+      --env DURATION=${K6_DURATION:-30s}
+      --env KEY_POOL=${K6_KEY_POOL:-500}
+      --env SCENARIO=${K6_SCENARIO:-all}
+      /scripts/load-test.js
+
+  # ---------------------------------------------------------------------------
+  # k6 — load generator (real profile)
+  # ---------------------------------------------------------------------------
+  k6-real:
+    image: grafana/k6:latest
+    profiles: [real]
+    depends_on:
+      app-server-real:
+        condition: service_healthy
+    volumes:
+      - ./benchmarks/k6:/scripts
+      - ./benchmarks/k6/results:/results
+    environment:
+      K6_OUT: "json=/results/k6-raw.json"
+      K6_WEB_DASHBOARD: "true"
+      K6_WEB_DASHBOARD_EXPORT: "/results/report.html"
+    command: >
+      run
+      --env TARGET=http://app-server-real:3000
+      --env VUS=${K6_VUS:-200}
+      --env DURATION=${K6_DURATION:-30s}
+      --env KEY_POOL=${K6_KEY_POOL:-500}
+      --env SCENARIO=${K6_SCENARIO:-all}
+      /scripts/load-test.js

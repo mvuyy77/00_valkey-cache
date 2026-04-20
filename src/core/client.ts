@@ -5,22 +5,22 @@ import {
     GlideClusterClientConfiguration,
 } from '@valkey/valkey-glide';
 import { ValidatedConfig, AuthConfigSchema } from '../config/schema';
-import { Logger } from '../types/types';
+import { Logger, ValkeyConfigError, ValkeyConnectionError } from '../types/types';
 
 type AnyGlideClient = GlideClient | GlideClusterClient;
 type ClusterClient = AnyGlideClient | null;
 
 export class ValkeyClient {
     private config: ValidatedConfig | null = null;
+    private configError: string | null = null;
     private client: ClusterClient = null;
-    private clientPromise: Promise<ClusterClient> | null = null;
+    private clientPromise: Promise<AnyGlideClient> | null = null;
 
     constructor( private logger: Logger ) {
-        this.logger = logger;
         this.validateAndLoadConfig();
     }
 
-    private validateAndLoadConfig() : boolean {
+    private validateAndLoadConfig(): boolean {
         const env = ( process.env.NODE_APP_INSTANCE || "development" ).toLowerCase();
         const rawConfig = {
             host: process.env.VALKEY_HOST ?? "",
@@ -31,6 +31,8 @@ export class ValkeyClient {
             clusterMode: process.env.VALKEY_CLUSTER_MODE !== "false",
             connectionTimeout: 5000,
             requestTimeout: 5000,
+            // Glide default is 1000; 700 gives ~30% headroom before Valkey applies backpressure.
+            // See: https://glide.valkey.io/how-to/connections/limit-inflight-requests/#why-limit-inflight-requests
             inflightRequestsLimit: 700,
             username: process.env.VALKEY_USERNAME,
             password: process.env.VALKEY_PASSWORD
@@ -38,20 +40,24 @@ export class ValkeyClient {
 
         const parsedConfig = AuthConfigSchema.safeParse(rawConfig);
         if ( !parsedConfig.success ) {
+            const details = parsedConfig.error.issues
+                .map(issue => `${issue.path.join('.')}: ${issue.message}`)
+                .join('; ');
+            this.configError = `VALKEY_CONFIG_INVALID: ${details || 'unknown validation error'}`;
+            this.logger.error(this.configError);
             this.config = null;
-            this.errorHandler(parsedConfig.error);
             return false;
         }
 
+        this.configError = null;
         this.config = parsedConfig.data;
         this.logger.info(`VALKEY_CONFIG_VALIDATED: Connected to host - ${ this.config.host}`);
         return true;
     }
 
-    private async initializeValkeyConnection(): Promise<ClusterClient>{
+    private async initializeValkeyConnection(): Promise<AnyGlideClient>{
         if ( !this.config ) {
-            this.logger.error("VALKEY_CONFIG_ERROR. Please validate config provided.")
-            return null;
+            throw new ValkeyConfigError(this.configError ?? 'VALKEY_CONFIG_INVALID: unknown validation error');
         }
 
         try {
@@ -89,6 +95,7 @@ export class ValkeyClient {
             } else {
                 const standaloneConfig: GlideClientConfiguration = {
                     ...sharedConfig,
+                    lazyConnect: this.config.lazyConnect,
                 };
                 this.client = await GlideClient.createClient(standaloneConfig);
             }
@@ -100,18 +107,17 @@ export class ValkeyClient {
             this.errorHandler(error);
             this.client = null;
             this.clientPromise = null;
-            return null;
+            throw error instanceof ValkeyConfigError ? error : new ValkeyConnectionError();
         }
     }
 
-    private async getClient(): Promise<ClusterClient> {
-        // Re-validate config on every call when config is missing.
-        // This makes the client self-healing: if env vars weren't available
-        // at construction time but appear later, the next connect() picks them up.
+    private async getClient(): Promise<AnyGlideClient> {
         if ( !this.config ) {
             this.validateAndLoadConfig();
         }
-        if ( !this.config ) return null;
+        if ( !this.config ) {
+            throw new ValkeyConfigError(this.configError ?? 'VALKEY_CONFIG_INVALID: unknown validation error');
+        }
         if ( this.client ) return this.client;
         if ( !this.clientPromise ) {
             this.clientPromise = this.initializeValkeyConnection();
@@ -121,8 +127,7 @@ export class ValkeyClient {
             return await this.clientPromise;
         } catch (error) {
             this.clientPromise = null;
-            this.errorHandler(error);
-            return null;
+            throw error;
         }
     }
 
@@ -140,14 +145,14 @@ export class ValkeyClient {
         }
     }
 
-    public connect(): Promise<ClusterClient> {
-        return this.getClient()
+    public connect(): Promise<AnyGlideClient> {
+        return this.getClient();
     }
 
     private errorHandler(error: unknown) {
         if ( !error ) return;
         const errorType = ( error instanceof Error ) ? error.name : "UnknownError";
         const errorMessage = ( error instanceof Error ) ? error.message : String(error);
-        this.logger.error(`Error Encountered: ${ errorType } - message: ${ errorMessage }`);
+        this.logger.error(`VALKEY_ERROR [${ errorType }]: ${ errorMessage }`);
     }
 }

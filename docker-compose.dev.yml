@@ -1,0 +1,26 @@
+# docker-compose.dev.yml
+#
+# Dev environment: Valkey only.
+# The mock server runs on the host (avoids esbuild cross-platform issues with
+# mounted node_modules). Start it in a separate terminal with:
+#   npm run dev:mock
+#
+# Usage:
+#   npm run dev:up     — start Valkey in the background
+#   npm run dev:mock   — start mock server on host (separate terminal)
+#   npm run dev        — start Valkey + run playground once
+#   npm run dev:watch  — restart playground on file save
+#   npm run dev:reset  — flush all Valkey keys
+#   npm run dev:down   — tear down Valkey container
+
+services:
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 10

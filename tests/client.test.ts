@@ -167,26 +167,49 @@ describe("ValkeyClient — connect()", () => {
         mockCreateClient.mockReset();
     });
 
-    it("returns null when config is invalid and env vars remain bad", async () => {
+    it("throws with VALKEY_CONFIG_INVALID and the failing field when config is invalid", async () => {
         vi.stubEnv("VALKEY_HOST", "");
         vi.stubEnv("VALKEY_PORT", "6379");
         const client = new ValkeyClient(silentLogger);
 
-        const result = await client.connect();
-        expect(result).toBeNull();
+        await expect(client.connect()).rejects.toThrow(/VALKEY_CONFIG_INVALID.*host/);
         expect(mockCreateClient).not.toHaveBeenCalled();
     });
 
+    it("thrown error message matches the error logged at construction", async () => {
+        vi.stubEnv("VALKEY_HOST", "");
+        vi.stubEnv("VALKEY_PORT", "6379");
+        const logger = spyLogger();
+        const client = new ValkeyClient(logger);
+
+        let thrownMessage = "";
+        try {
+            await client.connect();
+        } catch (e) {
+            thrownMessage = (e as Error).message;
+        }
+
+        expect(logger.calls.error.some(m => m === thrownMessage)).toBe(true);
+    });
+
+    it("thrown error is distinguishable from a connection failure", async () => {
+        vi.stubEnv("VALKEY_HOST", "");
+        vi.stubEnv("VALKEY_PORT", "6379");
+        const client = new ValkeyClient(silentLogger);
+
+        const error = await client.connect().catch(e => e as Error);
+        expect(error.message).toMatch(/^VALKEY_CONFIG_INVALID/);
+        expect(error.message).not.toMatch(/^VALKEY_ERROR/);
+    });
+
     it("self-heals when env vars become available after construction", async () => {
-        // Construct with missing env vars — config fails at construction
         vi.stubEnv("VALKEY_HOST", "");
         vi.stubEnv("VALKEY_PORT", "6379");
         const client = new ValkeyClient(silentLogger);
         expect(priv(client).config).toBeNull();
 
-        // First connect returns null
-        const first = await client.connect();
-        expect(first).toBeNull();
+        // connect() throws while config is still invalid
+        await expect(client.connect()).rejects.toThrow(/VALKEY_CONFIG_INVALID.*host/);
 
         // Env vars appear (e.g., dotenv loaded late, secret injected)
         vi.stubEnv("VALKEY_HOST", "valkey.example.com");
@@ -194,9 +217,9 @@ describe("ValkeyClient — connect()", () => {
         const fakeGlide = createFakeGlideClient();
         mockCreateClient.mockResolvedValue(fakeGlide as any);
 
-        // Next connect re-validates, picks up the new env vars, connects
-        const second = await client.connect();
-        expect(second).toBe(fakeGlide);
+        // Next connect re-validates, picks up the new env vars, connects successfully
+        const result = await client.connect();
+        expect(result).toBe(fakeGlide);
         expect(priv(client).config).not.toBeNull();
         expect(mockCreateClient).toHaveBeenCalledTimes(1);
     });
@@ -244,19 +267,17 @@ describe("ValkeyClient — connect()", () => {
         expect(mockCreateClient).toHaveBeenCalledTimes(1);
     });
 
-    it("logs VALKEY_CONFIG_ERROR and returns null when initializeValkeyConnection is called with null config", async () => {
+    it("throws ValkeyConfigError when initializeValkeyConnection is called with null config", async () => {
         setValidEnv();
-        const logger = spyLogger();
-        const client = new ValkeyClient(logger);
+        const client = new ValkeyClient(silentLogger);
 
         // Forcibly null out the config to exercise the early-return guard inside
-        // initializeValkeyConnection (lines 53-54 in client.ts).
+        // initializeValkeyConnection.
         priv(client).config = null;
 
-        const result = await (client as any).initializeValkeyConnection();
-
-        expect(result).toBeNull();
-        expect(logger.calls.error.some((m) => m.includes("VALKEY_CONFIG_ERROR"))).toBe(true);
+        await expect(
+            (client as any).initializeValkeyConnection()
+        ).rejects.toThrow(/VALKEY_CONFIG_INVALID/);
         expect(mockCreateClient).not.toHaveBeenCalled();
     });
 
@@ -277,22 +298,17 @@ describe("ValkeyClient — connect()", () => {
         expect(mockCreateClient).toHaveBeenCalledTimes(1);
     });
 
-    it("clears clientPromise and returns null when the in-flight promise rejects", async () => {
+    it("clears clientPromise and rethrows when the in-flight promise rejects", async () => {
         setValidEnv();
-        const logger = spyLogger();
-        const client = new ValkeyClient(logger);
+        const client = new ValkeyClient(silentLogger);
 
-        // Inject a rejecting promise directly to hit the catch block in getClient()
-        // (lines 122-125). initializeValkeyConnection normally swallows errors and
-        // returns null, so the only way to reach this branch is via direct injection.
+        // Inject a rejecting promise directly to hit the catch block in getClient().
         const injected = Promise.reject(new Error("injected rejection"));
         // Prevent unhandled-rejection noise — getClient() will await and handle it.
         injected.catch(() => {});
         priv(client).clientPromise = injected;
 
-        const result = await client.connect();
-
-        expect(result).toBeNull();
+        await expect(client.connect()).rejects.toThrow("injected rejection");
         expect(priv(client).clientPromise).toBeNull(); // cleared so next connect() retries
     });
 
@@ -332,11 +348,10 @@ describe("ValkeyClient — connect()", () => {
 
         const client = new ValkeyClient(silentLogger);
 
-        const first = await client.connect();
-        expect(first).toBeNull();
+        // First attempt throws — clientPromise is cleared so the next call retries.
+        await expect(client.connect()).rejects.toThrow();
 
-        // clientPromise is cleared on failure, so the next connect()
-        // creates a fresh attempt without requiring disconnect() first.
+        // Second attempt succeeds.
         const second = await client.connect();
         expect(second).toBe(fakeGlide);
         expect(mockCreateClient).toHaveBeenCalledTimes(2);
