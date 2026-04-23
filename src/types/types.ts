@@ -79,11 +79,12 @@ export interface RequestContext {
     uri?: string;
     method?: HttpMethod;
     headers?: Record<string, any>;
-    body?: Record<string, unknown> | undefined;
+    body?: Record<string, unknown> | unknown[] | undefined;
     params?: Record<string, string>;
     queryParams?: Record<string, string>;
     apiFetchTimeoutInSeconds?: number;
     requestTimeout?: number;
+    cacheKeyHeaders?: string[];
 };
 
 export enum ServiceManifest {

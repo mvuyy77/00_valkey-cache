@@ -85,7 +85,6 @@ services:
       CONTAINER_MEMORY_LIMIT: "512m"
       CONTAINER_CPU_LIMIT: "0.5"
       V8_HEAP_LIMIT_MB: "384"
-      KEY_POOL_SIZE: "${KEY_POOL_SIZE:-500}"
     volumes:
       - ./benchmarks:/app/benchmarks
 
@@ -130,7 +129,6 @@ services:
       CONTAINER_MEMORY_LIMIT: "1g"
       CONTAINER_CPU_LIMIT: "1.0"
       V8_HEAP_LIMIT_MB: "896"
-      KEY_POOL_SIZE: "${KEY_POOL_SIZE:-500}"
       PROFILE: "${PROFILE:-0}"
     volumes:
       - ./benchmarks:/app/benchmarks

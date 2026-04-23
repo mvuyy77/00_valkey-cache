@@ -26,7 +26,7 @@ import { ValkeyClient } from "./client";
 export class ValkeyService {
 	private requestsInFlight = new Map<string, Promise<any>>();
 	// 100 concurrent ops keeps service-layer load well under the connection's inflightRequestsLimit (700).
-	private limit = pLimit(100);
+	private limit = pLimit(20);
 	// Requests beyond the 100 concurrent slots queue here; reject once queue exceeds this to shed load early.
 	private MAX_QUEUE_SIZE = 500;
 	private breakers = new Map<string, CircuitBreaker>();
@@ -105,6 +105,17 @@ export class ValkeyService {
 			if (lower in lowered) result[lower] = lowered[lower];
 		}
 		return result;
+	}
+
+	private missingCacheKeyHeaders(prefix: string, ctx: RequestContext): string[] {
+		const cacheKeyHeaders = [
+			...(this.manifest[prefix].cacheKeyHeaders ?? []),
+			...(ctx.cacheKeyHeaders ?? []),
+		];
+		if (cacheKeyHeaders.length === 0) return [];
+		const selected = this.selectHeadersForCacheKey(ctx.headers ?? {}, cacheKeyHeaders);
+		const unique = new Set(cacheKeyHeaders.map((h) => h.toLowerCase()));
+		return [...unique].filter((h) => !(h in selected));
 	}
 
 	public async getFromCache(
@@ -328,7 +339,10 @@ export class ValkeyService {
 
 	private generateCacheKey(prefix: string, ctx: RequestContext): string {
 		const method = this.manifest[prefix].method;
-		const cacheKeyHeaders = this.manifest[prefix].cacheKeyHeaders ?? [];
+		const cacheKeyHeaders = [
+			...(this.manifest[prefix].cacheKeyHeaders ?? []),
+			...(ctx.cacheKeyHeaders ?? []),
+		];
 		const url = this.buildUpstreamUrl(prefix, ctx);
 		const hashAlgorithm = "sha256";
 
@@ -377,7 +391,14 @@ export class ValkeyService {
 				} catch {
 					// Valkey unavailable — proceed without cache
 				}
-				if (isConnected && manifest.TTLInSeconds > 0) {
+				const missing = this.missingCacheKeyHeaders(prefix, ctx);
+				if (missing.length > 0) {
+					this.logger.warn(
+						`CACHE_BYPASS: ${prefix} — cacheKeyHeaders not provided in request: ${missing.join(", ")}`,
+					);
+				}
+
+				if (isConnected && manifest.TTLInSeconds > 0 && missing.length === 0) {
 					const readFromCache = await this.getFromCache(cacheKey);
 					if (readFromCache?.status === "HIT" && readFromCache.data) {
 						this.logger.debug(
@@ -421,7 +442,7 @@ export class ValkeyService {
 				// Parse JSON once here rather than storing raw bytes and re-parsing on every cache HIT.
 				const parsed = JSON.parse(result.data.toString()) as T;
 
-				if (isConnected) {
+				if (isConnected && missing.length === 0) {
 					// Pack + gzip + write runs entirely in the background so the caller
 					// gets their data immediately. gzipSync was blocking the event loop
 					// for the full compression duration on every cache miss — at large

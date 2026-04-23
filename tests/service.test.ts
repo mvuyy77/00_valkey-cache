@@ -159,6 +159,40 @@ describe("ValkeyService.generateCacheKey", () => {
         expect(without).toBe(with_);
     });
 
+    // -- ctx.cacheKeyHeaders ------------------------------------------------
+
+    it("differs when a ctx.cacheKeyHeaders value changes (manifest has no cacheKeyHeaders)", () => {
+        // userSearch has no cacheKeyHeaders in the manifest — ctx must supply them
+        const a = reachPrivate(service).generateCacheKey("userSearch", {
+            ...baseCtx,
+            method: "POST",
+            headers: { "x-login-id": "user1" },
+            cacheKeyHeaders: ["x-login-id"],
+        });
+        const b = reachPrivate(service).generateCacheKey("userSearch", {
+            ...baseCtx,
+            method: "POST",
+            headers: { "x-login-id": "user2" },
+            cacheKeyHeaders: ["x-login-id"],
+        });
+        expect(a).not.toBe(b);
+    });
+
+    it("merges ctx.cacheKeyHeaders with manifest cacheKeyHeaders", () => {
+        // userProfile manifest has ["x-tenant", "x-a", "x-b"]; ctx adds "x-extra"
+        const withExtra = reachPrivate(service).generateCacheKey("userProfile", {
+            ...baseCtx,
+            headers: { "x-tenant": "t1", "x-extra": "v1" },
+            cacheKeyHeaders: ["x-extra"],
+        });
+        const withDiffExtra = reachPrivate(service).generateCacheKey("userProfile", {
+            ...baseCtx,
+            headers: { "x-tenant": "t1", "x-extra": "v2" },
+            cacheKeyHeaders: ["x-extra"],
+        });
+        expect(withExtra).not.toBe(withDiffExtra);
+    });
+
     // -- request body inclusion ---------------------------------------------
 
     it("does not include the request body for GET requests", () => {
@@ -390,6 +424,163 @@ describe("ValkeyService.getOrFetch", () => {
 // Tier 2: Cache HIT / WRITE path
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Tier 2: Missing cacheKeyHeaders bypass
+// ---------------------------------------------------------------------------
+
+describe("ValkeyService.getOrFetch — missing cacheKeyHeaders bypass", () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        vi.unstubAllEnvs();
+    });
+
+    it("logs a warning when configured cacheKeyHeaders are absent from the request", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const warnFn = vi.fn();
+        const capturingLogger: Logger = { ...silentLogger, warn: warnFn };
+
+        const service = new ValkeyService(
+            createFakeValkeyClient(),
+            manifest,
+            capturingLogger,
+        );
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })),
+        );
+
+        // userProfile manifest declares cacheKeyHeaders: ["x-tenant", "x-a", "x-b"]
+        // but we send none of them
+        await service.getOrFetch("userProfile", { ...baseCtx, headers: {} });
+
+        expect(
+            warnFn.mock.calls.some(([msg]: string[]) => msg.includes("CACHE_BYPASS")),
+        ).toBe(true);
+    });
+
+    it("skips cache read when cacheKeyHeaders are absent", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const fakeGlide = createFakeGlideClient();
+        const service = new ValkeyService(
+            createFakeValkeyClient(fakeGlide),
+            manifest,
+            silentLogger,
+        );
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })),
+        );
+
+        await service.getOrFetch("userProfile", { ...baseCtx, headers: {} });
+
+        expect(fakeGlide.get).not.toHaveBeenCalled();
+    });
+
+    it("skips cache write when cacheKeyHeaders are absent", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const fakeGlide = createFakeGlideClient();
+        const service = new ValkeyService(
+            createFakeValkeyClient(fakeGlide),
+            manifest,
+            silentLogger,
+        );
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })),
+        );
+
+        await service.getOrFetch("userProfile", { ...baseCtx, headers: {} });
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(fakeGlide.set).not.toHaveBeenCalled();
+    });
+
+    it("bypasses cache on second call too — does not serve first response to all", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const fakeGlide = createFakeGlideClient();
+        const service = new ValkeyService(
+            createFakeValkeyClient(fakeGlide),
+            manifest,
+            silentLogger,
+        );
+
+        const fetchMock = vi.fn()
+            .mockResolvedValueOnce(new Response(JSON.stringify({ id: 1 }), { status: 200 }))
+            .mockResolvedValueOnce(new Response(JSON.stringify({ id: 2 }), { status: 200 }));
+        vi.stubGlobal("fetch", fetchMock);
+
+        const first = await service.getOrFetch("userProfile", { ...baseCtx, headers: {}, uri: "/a" });
+        const second = await service.getOrFetch("userProfile", { ...baseCtx, headers: {}, uri: "/a" });
+
+        // Both must reach the upstream — no stale cache served
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(first.data).toEqual({ id: 1 });
+        expect(second.data).toEqual({ id: 2 });
+    });
+
+    it("still reads and writes cache when all cacheKeyHeaders are present", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const fakeGlide = createFakeGlideClient();
+        fakeGlide.get.mockResolvedValue(null); // MISS on first call
+
+        const service = new ValkeyService(
+            createFakeValkeyClient(fakeGlide),
+            manifest,
+            silentLogger,
+        );
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 3 }), { status: 200 })),
+        );
+
+        await service.getOrFetch("userProfile", {
+            ...baseCtx,
+            headers: { "x-tenant": "t1", "x-a": "a1", "x-b": "b1" },
+        });
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(fakeGlide.get).toHaveBeenCalledTimes(1);
+        expect(fakeGlide.set).toHaveBeenCalledTimes(1);
+    });
+
+    it("warns listing only the absent headers, not present ones", async () => {
+        vi.stubEnv("GATEWAY_URL", "");
+        const warnFn = vi.fn();
+        const capturingLogger: Logger = { ...silentLogger, warn: warnFn };
+
+        const service = new ValkeyService(
+            createFakeValkeyClient(),
+            manifest,
+            capturingLogger,
+        );
+
+        vi.stubGlobal(
+            "fetch",
+            vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200 })),
+        );
+
+        // Provide x-tenant but omit x-a and x-b
+        await service.getOrFetch("userProfile", {
+            ...baseCtx,
+            headers: { "x-tenant": "t1" },
+        });
+
+        const warnMsg = warnFn.mock.calls.find(([msg]: string[]) =>
+            msg.includes("CACHE_BYPASS"),
+        )?.[0] as string | undefined;
+
+        expect(warnMsg).toBeDefined();
+        expect(warnMsg).not.toContain("x-tenant");
+        expect(warnMsg).toContain("x-a");
+        expect(warnMsg).toContain("x-b");
+    });
+});
+
 describe("ValkeyService.getOrFetch — cache behavior", () => {
     afterEach(() => {
         vi.restoreAllMocks();
@@ -414,7 +605,10 @@ describe("ValkeyService.getOrFetch — cache behavior", () => {
         const fetchMock = vi.fn();
         vi.stubGlobal("fetch", fetchMock);
 
-        const result = await service.getOrFetch("userProfile", baseCtx);
+        const result = await service.getOrFetch("userProfile", {
+            ...baseCtx,
+            headers: { "x-tenant": "t1", "x-a": "a1", "x-b": "b1" },
+        });
 
         expect(result.data).toEqual(cachedData);
         expect(fetchMock).not.toHaveBeenCalled();
@@ -440,7 +634,10 @@ describe("ValkeyService.getOrFetch — cache behavior", () => {
             ),
         );
 
-        const result = await service.getOrFetch("userProfile", baseCtx);
+        const result = await service.getOrFetch("userProfile", {
+            ...baseCtx,
+            headers: { "x-tenant": "t1", "x-a": "a1", "x-b": "b1" },
+        });
         expect(result.data).toEqual(responseData);
 
         // setToCache is fire-and-forget — wait a tick for it to execute
@@ -483,7 +680,10 @@ describe("ValkeyService.getOrFetch — cache behavior", () => {
         );
 
         // getOrFetch should resolve normally — the write error must not propagate
-        const result = await service.getOrFetch("userProfile", baseCtx);
+        const result = await service.getOrFetch("userProfile", {
+            ...baseCtx,
+            headers: { "x-tenant": "t1", "x-a": "a1", "x-b": "b1" },
+        });
         expect(result.data).toEqual({ id: 1 });
 
         // Flush the fire-and-forget microtask
@@ -950,7 +1150,11 @@ describe("ValkeyService — event loop lag", () => {
         const lag = await measureMaxLag(async () => {
             for (let i = 0; i < 200; i++) {
                 // Different uri → different cache key → no in-flight dedup
-                await service.getOrFetch("userProfile", { ...baseCtx, uri: `/${i}` });
+                await service.getOrFetch("userProfile", {
+                    ...baseCtx,
+                    uri: `/${i}`,
+                    headers: { "x-tenant": "t1", "x-a": "a1", "x-b": "b1" },
+                });
             }
         });
 
@@ -1112,19 +1316,19 @@ describe("ValkeyService — circuit breaker event callbacks", () => {
     it("logs CIRCUIT_CLOSED when the breaker closes (upstream recovered)", async () => {
         const { breaker, infoFn } = await buildServiceAndGetBreaker();
         breaker.emit("close");
-        expect(infoFn.mock.calls.some(([m]: [string]) => m.includes("CIRCUIT_CLOSED"))).toBe(true);
+        expect(infoFn.mock.calls.some(([m]: string[]) => m.includes("CIRCUIT_CLOSED"))).toBe(true);
     });
 
     it("logs CIRCUIT_TIMEOUT when the breaker fires the timeout event", async () => {
         const { breaker, warnFn } = await buildServiceAndGetBreaker();
         breaker.emit("timeout");
-        expect(warnFn.mock.calls.some(([m]: [string]) => m.includes("CIRCUIT_TIMEOUT"))).toBe(true);
+        expect(warnFn.mock.calls.some(([m]: string[]) => m.includes("CIRCUIT_TIMEOUT"))).toBe(true);
     });
 
     it("logs CIRCUIT_REJECT when the breaker fires the reject event", async () => {
         const { breaker, warnFn } = await buildServiceAndGetBreaker();
         breaker.emit("reject");
-        expect(warnFn.mock.calls.some(([m]: [string]) => m.includes("CIRCUIT_REJECT"))).toBe(true);
+        expect(warnFn.mock.calls.some(([m]: string[]) => m.includes("CIRCUIT_REJECT"))).toBe(true);
     });
 });
 

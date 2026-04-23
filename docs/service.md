@@ -33,6 +33,12 @@ getOrFetch(prefix, ctx)
                       v
                 connect to Valkey
                       |
+                check missingCacheKeyHeaders
+                      |
+                +--[any absent]--> warn CACHE_BYPASS, skip cache entirely
+                |
+                +--[all present or none required]
+                      |
                 +--[connected + TTL > 0]--> getFromCache()
                 |                               |
                 |                        [HIT] --> gunzip (if >=1KB), unpack(msgpack), return
@@ -53,7 +59,7 @@ getOrFetch(prefix, ctx)
                                 |
                          [2xx]-------> JSON.parse response
                                 |        |
-                                |   [connected]--> pack(msgpack)
+                                |   [connected + no missing headers]--> pack(msgpack)
                                 |        |           |
                                 |        |    [>=1KB]--> gzip(packed)
                                 |        |           |
@@ -111,11 +117,13 @@ Where `resolvedUrl` is the output of `buildUpstreamUrl` — base + path-param-re
 
 ### Header selection (`cacheKeyHeaders`)
 
-By default, no request headers are included in the cache key. Only headers explicitly listed in the manifest entry's `cacheKeyHeaders` field are used. This is an allow-list: any header absent from the list — including auth headers, cookies, and proxy-injected headers like `x-forwarded-for` — is silently ignored.
+By default, no request headers are included in the cache key. Only headers explicitly listed in `cacheKeyHeaders` are used — this is an allow-list. Any header absent from the list — including auth headers, cookies, and proxy-injected headers like `x-forwarded-for` — is silently ignored.
 
 This prevents a common failure mode where a proxy or load balancer injects a new header, unexpectedly making every request generate a unique cache key and dropping hit rates to zero.
 
-To vary cache entries by a header, declare it in the manifest:
+`cacheKeyHeaders` can be declared in two places and are merged at key-generation time:
+
+**Manifest level** — for headers that always differentiate responses for a given endpoint:
 
 ```ts
 [ServiceManifest.AUTH_PROFILE_V2]: {
@@ -127,16 +135,29 @@ To vary cache entries by a header, declare it in the manifest:
 },
 ```
 
-The `apikey` header is provided by the consumer at call time via `RequestContext.headers`:
+**Request level** — for headers the consumer controls and the manifest cannot anticipate:
 
 ```ts
 await ValkeyCacheWrapper.getWithFetch(ServiceManifest.AUTH_PROFILE_V2, {
     baseUrl: process.env.GATEWAY_URL,
-    headers: { apikey: process.env.MS_API_KEY, "x-tenant": tenantId },
+    headers: { apikey: process.env.MS_API_KEY, "x-login-id": loginId },
+    cacheKeyHeaders: ["x-login-id"],   // include loginId in the cache key
 });
 ```
 
-If `cacheKeyHeaders` is omitted or empty, the key is based solely on the prefix, method, and URL.
+Both lists are combined — a header in either source is included in the key. If both are omitted or empty, the key is based solely on the prefix, method, and URL.
+
+#### Cache bypass on missing headers
+
+If `cacheKeyHeaders` are configured but any of the listed headers are **absent** from `ctx.headers`, the request bypasses the cache entirely — no read and no write. The service logs a `CACHE_BYPASS` warning at `warn` level and falls through to the origin fetch.
+
+```
+CACHE_BYPASS: userProfile — cacheKeyHeaders not provided in request: x-tenant, x-a
+```
+
+This prevents a silent data-leak: without this guard, all requests missing a required header would share the same base cache key (no header segment appended), and the first response to be written would be served to every subsequent caller regardless of their identity.
+
+If a header is present for some requests but absent for others, only the requests that supply all required headers participate in caching. Requests with missing headers always hit the origin and are never written to cache.
 
 ### Header ordering
 
@@ -264,6 +285,19 @@ Each breaker emits log entries on state transitions via `registerBreakerEvents`:
 ### TTL=0 skips reads but not writes
 
 When a manifest entry has `TTLInSeconds: 0`, the cache read is skipped (gated by `manifest.TTLInSeconds > 0`), but the cache write still executes (gated only by `isConnected`). This means data is written to Valkey with the default TTL even when reads are disabled. This is an intentional asymmetry — it pre-warms the cache so that toggling the TTL back to a positive value immediately starts serving hits.
+
+### Cache bypass on missing `cacheKeyHeaders`
+
+When a manifest entry declares `cacheKeyHeaders` and the request is missing any of those headers, the service skips both the cache read and the cache write and logs a `CACHE_BYPASS` warning. Every such request hits the origin.
+
+This is a correctness guard, not a performance setting. A request that lacks a required discriminator header cannot be safely cached — without the header, it would generate the same key as every other request also missing that header, and the first cached response would be silently served to all of them regardless of their actual identity or tenant.
+
+Common triggers:
+- A new `cacheKeyHeaders` entry was added to the manifest but the call site was not updated to forward the header.
+- A middleware or proxy that was supposed to inject the header is misconfigured or disabled.
+- The header name in the manifest has a typo (e.g., `"x-tennant"` instead of `"x-tenant"`).
+
+If you see persistent `CACHE_BYPASS` warnings in production, check that every call site that reaches this prefix passes all headers listed in the manifest.
 
 ### `onlyIfDoesNotExist` write semantics
 

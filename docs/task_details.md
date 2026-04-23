@@ -63,3 +63,12 @@ Review of all methods under `src/` categorized by CPU, I/O, and memory intensity
 - **`performFetch()`** is CPU + memory + I/O together — the entire response is buffered in memory before parsing.
 - **`generateCacheKey()`** is the most purely CPU-bound operation — a deeply nested request body with many keys will cause noticeable latency in the inline key-sorting stringify.
 - The `requestsInFlight` Map caps at `MAX_QUEUE_SIZE = 500`, so memory pressure from deduplication is bounded.
+
+
+| Component | Data Size | V8 Object Overhead | Total (Approx) |
+| :--- | :--- | :--- | :--- |
+| **SHA-256 Key** | 64 chars | +16 (Header) + Alignment | **~80 bytes** |
+| **Map Entry** | 24 (Pointers) | Hash Table Sparsity / Buckets | **~100 bytes** |
+| **Promise Ref** | 8 bytes | None (it's a raw pointer) | **8 bytes** |
+| **Padding/Slack** | - | 8-byte word alignment rounding | **~46 bytes** |
+| **Total** | | | **~234 bytes** |

@@ -151,9 +151,12 @@ getOrFetch(prefix, ctx)
   ├─ generate cache key  (sha256 of prefix + method + url + selected headers + body)
   │
   ├─ connect to Valkey
-  │     └─ if connected + TTL > 0: check cache
-  │             └─ HIT  → gunzip → unpack (msgpack) → return data
-  │             └─ MISS → continue
+  │     └─ check missingCacheKeyHeaders
+  │             └─ any absent → warn CACHE_BYPASS, skip cache (read + write)
+  │             └─ all present (or none required):
+  │                   if connected + TTL > 0: check cache
+  │                         └─ HIT  → gunzip → unpack (msgpack) → return data
+  │                         └─ MISS → continue
   │
   ├─ check p-limit queue (max 100 concurrent, 500 queued → 503)
   │
@@ -583,6 +586,28 @@ This happens when `node_modules` is mounted from macOS into a Linux container. T
 npm install               # pick up any new dependencies
 npm run typecheck         # confirm clean compile
 ```
+
+### `CACHE_BYPASS` warnings in logs (or tests)
+
+```
+CACHE_BYPASS: userProfile — cacheKeyHeaders not provided in request: x-tenant
+```
+
+This warning fires when a manifest entry declares `cacheKeyHeaders` but the request does not include those headers. The cache is bypassed — no read, no write — and the origin is hit every time.
+
+Common causes:
+
+1. **Call site not updated** — a `cacheKeyHeaders` entry was added to the manifest but the call site was not updated to forward the header. Add the header to `ctx.headers` at the call site.
+
+2. **Unit test using bare `baseCtx`** — `baseCtx` has `headers: {}`. If the prefix under test has `cacheKeyHeaders`, the test will bypass cache and never exercise the cache read/write path. Provide the required headers explicitly:
+   ```ts
+   await service.getOrFetch("userProfile", {
+       ...baseCtx,
+       headers: { "x-tenant": "t1", "x-a": "a1", "x-b": "b1" },
+   });
+   ```
+
+3. **Header name typo in manifest** — `"x-tennant"` vs `"x-tenant"`. The check is case-insensitive, but a typo means the header is never matched. The warning lists the missing header names — compare against your actual request headers.
 
 ### Tests fail after changing `generateCacheKey`
 
